@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use ordered_float::NotNan;
@@ -9,11 +10,12 @@ use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::{AudioContext, AudioContextRegistration, BaseAudioContext};
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
-use web_audio_api::render::AudioProcessor;
+use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
+use web_audio_api::AudioBuffer;
 
 use fft::{
-    do_fft, load_file, random_project, Time, DURATION, FFT_LEN, PENALTY, PENALTY_TIME, REPEATS,
-    SEARCH_DIMENSIONS,
+    do_fft, load_file, random_project, Time, BONUS, BONUS_TIME, DURATION, FFT_LEN, PENALTY,
+    PENALTY_TIME, REPEATS, SEARCH_DIMENSIONS,
 };
 
 fn main() {
@@ -38,8 +40,6 @@ fn main() {
         // generate_varying_sine(&context, DURATION),
     );
     src.set_loop(true);
-    src.connect(&context.destination());
-    src.start();
 
     let fft = FftNode::new(
         &context,
@@ -48,11 +48,24 @@ fn main() {
             fft_run_interval: 8,
         },
     );
+    let (fft, prediction_rx) = fft.consume_receiver();
     src.connect(&fft);
 
-    // connect the node directly to the destination node (speakers)
-    src.connect(&context.destination());
+    let left_panner = context.create_stereo_panner();
+    left_panner.connect(&context.destination());
+    left_panner.pan().set_value(-1.);
+    src.connect(&left_panner);
 
+    let context = Arc::new(context);
+    let playback = PlaybackNode::new(context.clone(), PlaybackOptions { prediction_rx });
+    src.connect(&playback);
+
+    let right_panner = context.create_stereo_panner();
+    right_panner.connect(&context.destination());
+    right_panner.pan().set_value(1.);
+    playback.connect(&right_panner);
+
+    src.start();
     // enjoy listening
     std::thread::sleep(std::time::Duration::from_secs_f32(
         DURATION * REPEATS as f32,
@@ -62,10 +75,11 @@ fn main() {
     serde_json::to_writer(&File::create("output/data.json").unwrap(), &times).unwrap();
 }
 
-struct FftNode {
+struct FftNode<PredictionType> {
     registration: AudioContextRegistration,
     channel_config: ChannelConfig,
     times: Arc<Mutex<Vec<Time>>>,
+    prediction: PredictionType,
 }
 
 struct FftOptions {
@@ -74,7 +88,7 @@ struct FftOptions {
     fft_run_interval: usize,
 }
 
-impl FftNode {
+impl FftNode<Receiver<Prediction>> {
     fn new(context: &impl BaseAudioContext, options: FftOptions) -> Self {
         context.register(move |registration| {
             let real_planner: RealFftPlanner<f32> = RealFftPlanner::<f32>::new();
@@ -97,6 +111,8 @@ impl FftNode {
             past_input.reserve_exact(options.fft_len);
             past_input.append(&mut vec![0.0f32; options.fft_len].into());
 
+            let (tx, rx) = mpsc::channel();
+
             let render = FftRenderer {
                 planner: real_planner,
                 past_input,
@@ -109,19 +125,34 @@ impl FftNode {
                 btree: (0..SEARCH_DIMENSIONS).map(|_| BTreeMap::new()).collect(),
                 projections: HashMap::new(),
                 times: times.clone(),
+                last_predicted_time: (0.0, tx),
             };
             let node = FftNode {
                 registration,
                 channel_config: ChannelConfig::default(),
                 times,
+                prediction: rx,
             };
 
             (node, Box::new(render))
         })
     }
+
+    fn consume_receiver(self) -> (FftNode<()>, Receiver<Prediction>) {
+        let rx = self.prediction;
+        (
+            FftNode {
+                registration: self.registration,
+                channel_config: self.channel_config,
+                times: self.times,
+                prediction: (),
+            },
+            rx,
+        )
+    }
 }
 
-impl AudioNode for FftNode {
+impl<T> AudioNode for FftNode<T> {
     fn registration(&self) -> &web_audio_api::context::AudioContextRegistration {
         &self.registration
     }
@@ -151,6 +182,7 @@ struct FftRenderer {
     /// Map from timestamp to projections.
     projections: HashMap<NotNan<f64>, Vec<f64>>,
     times: Arc<Mutex<Vec<Time>>>,
+    last_predicted_time: (f64, Sender<Prediction>),
 }
 
 impl AudioProcessor for FftRenderer {
@@ -225,6 +257,12 @@ impl AudioProcessor for FftRenderer {
                                 PENALTY
                             } else {
                                 0.0
+                            }
+                            - if (scope.current_time - self.last_predicted_time.0) < BONUS_TIME {
+                                // Decrease error for times near last predicted time
+                                BONUS
+                            } else {
+                                0.0
                             },
                         n_time,
                     )
@@ -235,13 +273,165 @@ impl AudioProcessor for FftRenderer {
                     real: scope.current_time,
                     predicted: best_guess.1,
                     projection: current_projections.clone(),
-                })
+                });
+                self.last_predicted_time.0 = best_guess.1;
+                let _ = self.last_predicted_time.1.send(Prediction {
+                    predicted_time: best_guess.1,
+                    time_of_prediction: scope.current_time,
+                });
             }
             self.projections
                 .insert(scope.current_time.try_into().unwrap(), current_projections);
         }
         self.fft_counter += 1;
         self.fft_counter %= self.fft_run_interval;
+        false
+    }
+}
+
+struct PlaybackNode {
+    registration: AudioContextRegistration,
+    channel_config: ChannelConfig,
+}
+
+struct PlaybackOptions {
+    prediction_rx: Receiver<Prediction>,
+}
+
+impl PlaybackNode {
+    fn new(context: Arc<AudioContext>, options: PlaybackOptions) -> Self {
+        context.clone().register(move |registration| {
+            let render = PlaybackRenderer {
+                context: context.clone(),
+                past_data: ResizingBuffer::new(context),
+                prediction: options.prediction_rx,
+            };
+            let node = PlaybackNode {
+                registration,
+                channel_config: ChannelConfig::default(),
+            };
+
+            (node, Box::new(render))
+        })
+    }
+}
+
+impl AudioNode for PlaybackNode {
+    fn registration(&self) -> &web_audio_api::context::AudioContextRegistration {
+        &self.registration
+    }
+
+    fn channel_config(&self) -> &web_audio_api::node::ChannelConfig {
+        &self.channel_config
+    }
+
+    fn number_of_inputs(&self) -> usize {
+        1
+    }
+
+    fn number_of_outputs(&self) -> usize {
+        1
+    }
+}
+
+struct PlaybackRenderer {
+    context: Arc<AudioContext>,
+    past_data: ResizingBuffer,
+    prediction: Receiver<Prediction>,
+}
+
+struct Prediction {
+    predicted_time: f64,
+    time_of_prediction: f64,
+}
+
+struct ResizingBuffer {
+    buffer: AudioBuffer,
+    used: usize,
+    start_time: f64,
+    playback_index: usize,
+}
+
+impl ResizingBuffer {
+    // 64 quantums
+    const DEFAULT_SIZE: usize = 128 * 64;
+
+    fn new(context: Arc<AudioContext>) -> Self {
+        Self {
+            buffer: context.create_buffer(1, Self::DEFAULT_SIZE, context.sample_rate()),
+            used: 0,
+            start_time: context.current_time(),
+            playback_index: 0,
+        }
+    }
+
+    fn append(&mut self, context: Arc<AudioContext>, input: &AudioRenderQuantum) {
+        let input = input.channel_data(0);
+        // If out of capacity, double size of buffer.
+        if self.used + input.len() >= self.buffer.length() {
+            let mut new_buffer =
+                context.create_buffer(1, self.buffer.length() * 2, context.sample_rate());
+            new_buffer.copy_to_channel(self.buffer.get_channel_data(0), 0);
+            self.buffer = new_buffer;
+        }
+        // Copy in new data.
+        self.buffer.copy_to_channel_with_offset(input, 0, self.used);
+        self.used += input.len();
+    }
+
+    /// Sets the new time if it is far away.
+    fn try_set_time(&mut self, time: f64, sample_len: usize) -> bool {
+        let sample_duration = sample_len as f64 / self.buffer.sample_rate() as f64;
+        let time_tolerance = 100. * sample_duration;
+        let new_time = if (self.get_time() - time).abs() < time_tolerance {
+            return false;
+        } else {
+            time
+        };
+
+        let time_offset = new_time - self.start_time;
+        let new_index = (time_offset * self.buffer.sample_rate() as f64) as usize;
+        self.playback_index = new_index;
+        true
+    }
+
+    fn get_time(&self) -> f64 {
+        self.start_time + (self.playback_index as f64 / self.buffer.sample_rate() as f64)
+    }
+
+    fn play(&mut self, output: &mut AudioRenderQuantum) {
+        let output = output.channel_data_mut(0);
+        let written_count = output
+            .iter_mut()
+            .zip(self.buffer.get_channel_data(0)[self.playback_index..].iter())
+            .map(|(o, b)| *o = *b)
+            .count();
+        self.playback_index += written_count;
+    }
+}
+
+impl AudioProcessor for PlaybackRenderer {
+    fn process(
+        &mut self,
+        inputs: &[web_audio_api::render::AudioRenderQuantum],
+        outputs: &mut [web_audio_api::render::AudioRenderQuantum],
+        _params: web_audio_api::render::AudioParamValues<'_>,
+        scope: &web_audio_api::render::RenderScope,
+    ) -> bool {
+        self.past_data.append(self.context.clone(), &inputs[0]);
+        if let Ok(new_prediction) = self.prediction.try_recv() {
+            // Account for possible elapsed time between sending and receiving.
+            let updated_time = (scope.current_time - new_prediction.time_of_prediction)
+                + new_prediction.predicted_time;
+            self.past_data
+                .try_set_time(updated_time, inputs[0].channel_data(0).len());
+        }
+        // // Only play if much in the past.
+        // if scope.current_time - self.past_data.get_time() > DURATION as f64 {
+        //     self.past_data.play(&mut outputs[0]);
+        // }
+        self.past_data.play(&mut outputs[0]);
+
         false
     }
 }

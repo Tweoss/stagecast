@@ -4,7 +4,7 @@ use web_audio_api::context::BaseAudioContext;
 use web_audio_api::AudioBuffer;
 
 pub const SEARCH_DIMENSIONS: usize = 2usize.pow(5);
-// const DURATION: f32 = 10.;
+// pub const DURATION: f32 = 10.;
 pub const DURATION: f32 = 13. * 60. + 4.;
 pub const REPEATS: usize = 1;
 // TODO check best value
@@ -12,6 +12,10 @@ pub const REPEATS: usize = 1;
 pub const FFT_LEN: usize = 2usize.pow(17);
 pub const PENALTY_TIME: f64 = 2.0;
 pub const PENALTY: f64 = 0.5;
+/// How close a new predicted time must be to the last predicted time to get a bonus.
+pub const BONUS_TIME: f64 = 0.3;
+/// The amount of artificial decrease in error.
+pub const BONUS: f64 = 0.5;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Time {
