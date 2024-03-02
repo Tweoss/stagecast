@@ -1,0 +1,23 @@
+[package]
+name = "stagecast"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "fft"
+path = "src/lib.rs"
+
+[dependencies]
+ordered-float = { version = "4.0", default-features = false }
+plotters = "0.3.3"
+rand = { version = "0.8.5", features = [ "small_rng" ] }
+realfft = "3.3.0"
+serde_json = "1.0"
+serde = { version = "1.0", features = [ "derive" ] }
+web-audio-api = "0.42.0"
+
+[profile.release]
+debug = true
+
