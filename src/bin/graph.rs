@@ -41,11 +41,20 @@ fn main() {
     chart
         .draw_series(
             data.iter()
-                .map(|t| Circle::new((t.real, t.predicted), 2, GREEN.mix(0.03))),
+                .map(|t| Circle::new((t.real, t.predicted), 1, GREEN.mix(0.03))),
         )
         .unwrap()
         .label("predicted")
         .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
+
+    chart
+        .draw_series(
+            data.iter()
+                .map(|t| Circle::new((t.real, t.managed_prediction), 1, MAGENTA.mix(0.1))),
+        )
+        .unwrap()
+        .label("manager predicted")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA));
 
     // Fit the projection data max into DURATION * REPEATS / 2 height
     let all_data = data
