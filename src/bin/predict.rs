@@ -20,9 +20,6 @@ use fft::{
     PENALTY_FRAME, REPEATS, SEARCH_DIMENSIONS,
 };
 
-/// How many previous frames of projections to look at when calculating sum
-/// squared error.
-const ERROR_FRAME_HISTORY_COUNT: u64 = 1;
 /// Neighbor count per side per projection
 const NEIGHBOR_COUNT: usize = 1;
 
@@ -265,7 +262,6 @@ impl AudioProcessor for FftRenderer {
                 (
                     NotNan::new(calculate_error(
                         &self.frame_data.projections,
-                        &self.frame_data.frames,
                         n_frame,
                         scope.current_frame,
                     ))
@@ -297,42 +293,18 @@ impl AudioProcessor for FftRenderer {
 
 fn calculate_error(
     projections: &HashMap<u64, (usize, Vec<f64>)>,
-    frames: &[u64],
     neighbor_frame: u64,
     current_frame: u64,
 ) -> f64 {
     // Using sum squared error over all projections.
 
-    let current_index = projections
-        .get(&current_frame)
-        .expect("should have stored current frame's projection")
-        .0;
-    let neighbor_index = projections
+    let it = projections
         .get(&neighbor_frame)
-        .expect("should have neighbor's projection")
-        .0;
-
-    // Since we don't know (may change across web_audio_api versions) the quantum length,
-    // we just search backwards until we get enough frames (or run out of samples)
-    let it = frames[..=neighbor_index]
+        .unwrap()
+        .1
         .iter()
-        .rev()
-        .zip(frames[..=current_index].iter().rev())
-        .take(ERROR_FRAME_HISTORY_COUNT as usize)
-        .flat_map(|(n_i, c_i)| {
-            projections
-                .get(n_i)
-                .unwrap()
-                .1
-                .iter()
-                .zip(projections.get(c_i).unwrap().1.iter())
-        })
+        .zip(projections.get(&current_frame).unwrap().1.iter())
         .map(|(n, c)| (n - c).powi(2));
-    assert_ne!(
-        it.clone().count(),
-        0,
-        "Number of comparable frames should never be 0."
-    );
     (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
     // let frame_delta = current_frame.abs_diff(neighbor_frame);
 

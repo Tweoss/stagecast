@@ -19,6 +19,10 @@ pub const BONUS_FRAME: u64 = 100;
 /// The amount of artificial decrease in error.
 pub const BONUS: f64 = 100.0;
 
+/// How many samples from the start and ends of the fft input
+/// to smooth down. Reduces noise in fft output.
+const SMOOTHING_COUNT: usize = 128 * 5;
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Time {
     pub real: f64,
@@ -29,6 +33,19 @@ pub struct Time {
 
 pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut [Complex<f32>]) {
     let length = input.len();
+
+    // scale down ends.
+    input
+        .iter_mut()
+        .take(SMOOTHING_COUNT)
+        .enumerate()
+        .for_each(|(i, v)| *v *= (i as f32 / SMOOTHING_COUNT as f32).powi(2));
+    input
+        .iter_mut()
+        .rev()
+        .take(SMOOTHING_COUNT)
+        .enumerate()
+        .for_each(|(i, v)| *v *= (i as f32 / SMOOTHING_COUNT as f32).powi(2));
 
     // create a FFT
     let r2c = planner.plan_fft_forward(length);
@@ -42,7 +59,7 @@ pub fn random_project(input: &[Complex<f32>], projection: &[f32]) -> f32 {
     assert!(input.len() == projection.len() / 2 + 1);
     input
         .iter()
-        .map(|v| (v.norm_sqr().sqrt()))
+        .map(|v| v.norm_sqr().sqrt())
         // atan is a very expensive operation
         // .flat_map(|v| [v.norm_sqr().sqrt(), v.atan().re])
         .zip(projection.iter())
