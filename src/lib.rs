@@ -3,25 +3,28 @@ use realfft::RealFftPlanner;
 use web_audio_api::context::BaseAudioContext;
 use web_audio_api::AudioBuffer;
 
-pub const SEARCH_DIMENSIONS: usize = 2usize.pow(5);
+pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
 // pub const DURATION: f32 = 10.;
 pub const DURATION: f32 = 13. * 60. + 4.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
-pub const FFT_LEN: usize = 2usize.pow(17);
-pub const PENALTY_TIME: f64 = 2.0;
-pub const PENALTY: f64 = 0.5;
-/// How close a new predicted time must be to the last predicted time to get a bonus.
-pub const BONUS_TIME: f64 = 0.3;
+pub const FFT_LEN: usize = 2usize.pow(16);
+/// How close a frame should be to apply a penalty.
+// pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
+pub const PENALTY_FRAME: u64 = 44100 * 2;
+pub const PENALTY: f64 = 10.0;
+/// How close a new predicted frame must be to the last predicted time to get a bonus.
+pub const BONUS_FRAME: u64 = 100;
 /// The amount of artificial decrease in error.
-pub const BONUS: f64 = 0.5;
+pub const BONUS: f64 = 100.0;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Time {
     pub real: f64,
     pub predicted: f64,
     pub projection: Vec<f64>,
+    pub error: f64,
 }
 
 pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut [Complex<f32>]) {

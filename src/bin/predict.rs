@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
+use std::ops::Bound::Excluded;
+use std::ops::Bound::Unbounded;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -14,11 +16,21 @@ use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
 use web_audio_api::AudioBuffer;
 
 use fft::{
-    do_fft, load_file, random_project, Time, BONUS, BONUS_TIME, DURATION, FFT_LEN, PENALTY,
-    PENALTY_TIME, REPEATS, SEARCH_DIMENSIONS,
+    do_fft, load_file, random_project, Time, BONUS, BONUS_FRAME, DURATION, FFT_LEN, PENALTY,
+    PENALTY_FRAME, REPEATS, SEARCH_DIMENSIONS,
 };
 
+/// How many previous frames of projections to look at when calculating sum
+/// squared error.
+const ERROR_FRAME_HISTORY_COUNT: u64 = 1;
+/// Neighbor count per side per projection
+const NEIGHBOR_COUNT: usize = 1;
+
 fn main() {
+    let output_file = std::env::args()
+        .nth(1)
+        .expect("pass the output json path as an argument");
+
     // let context = OfflineAudioContext::new(1, 44100 * DURATION as usize, 44100.0);
     let context = AudioContext::default();
 
@@ -41,20 +53,13 @@ fn main() {
     );
     src.set_loop(true);
 
-    let fft = FftNode::new(
-        &context,
-        FftOptions {
-            fft_len: FFT_LEN,
-            fft_run_interval: 8,
-        },
-    );
+    let fft = FftNode::new(&context, FftOptions { fft_len: FFT_LEN });
     let (fft, prediction_rx) = fft.consume_receiver();
     src.connect(&fft);
 
     let left_panner = context.create_stereo_panner();
     left_panner.connect(&context.destination());
     left_panner.pan().set_value(-1.);
-    src.connect(&left_panner);
 
     let context = Arc::new(context);
     let playback = PlaybackNode::new(context.clone(), PlaybackOptions { prediction_rx });
@@ -63,7 +68,8 @@ fn main() {
     let right_panner = context.create_stereo_panner();
     right_panner.connect(&context.destination());
     right_panner.pan().set_value(1.);
-    playback.connect(&right_panner);
+    src.connect(&right_panner);
+    playback.connect(&left_panner);
 
     src.start();
     // enjoy listening
@@ -72,7 +78,7 @@ fn main() {
     ));
 
     let times = fft.times.lock().unwrap().to_vec();
-    serde_json::to_writer(&File::create("output/data.json").unwrap(), &times).unwrap();
+    serde_json::to_writer(&File::create(output_file).unwrap(), &times).unwrap();
 }
 
 struct FftNode<PredictionType> {
@@ -84,8 +90,6 @@ struct FftNode<PredictionType> {
 
 struct FftOptions {
     fft_len: usize,
-    /// Number of samples before running another fft
-    fft_run_interval: usize,
 }
 
 impl FftNode<Receiver<Prediction>> {
@@ -114,18 +118,20 @@ impl FftNode<Receiver<Prediction>> {
             let (tx, rx) = mpsc::channel();
 
             let render = FftRenderer {
+                sample_rate: context.sample_rate() as f64,
                 planner: real_planner,
                 past_input,
                 data: vec![Complex::new(0.0, 0.0); options.fft_len / 2 + 1],
-                fft_run_interval: options.fft_run_interval,
-                fft_counter: 0,
                 random_vector: (0..SEARCH_DIMENSIONS)
                     .map(|_| gen_random_vector())
                     .collect(),
-                btree: (0..SEARCH_DIMENSIONS).map(|_| BTreeMap::new()).collect(),
-                projections: HashMap::new(),
+                frame_data: FrameData {
+                    btree: (0..SEARCH_DIMENSIONS).map(|_| BTreeMap::new()).collect(),
+                    projections: HashMap::new(),
+                    frames: vec![],
+                },
                 times: times.clone(),
-                last_predicted_time: (0.0, tx),
+                last_prediction: (0, tx),
             };
             let node = FftNode {
                 registration,
@@ -171,18 +177,23 @@ impl<T> AudioNode for FftNode<T> {
 }
 
 struct FftRenderer {
+    sample_rate: f64,
     past_input: VecDeque<f32>,
     data: Vec<Complex<f32>>,
     planner: RealFftPlanner<f32>,
-    fft_run_interval: usize,
-    fft_counter: usize,
     random_vector: Vec<Vec<f32>>,
-    /// Map from random projection to timestamp
-    btree: Vec<BTreeMap<NotNan<f32>, f64>>,
-    /// Map from timestamp to projections.
-    projections: HashMap<NotNan<f64>, Vec<f64>>,
+    frame_data: FrameData,
     times: Arc<Mutex<Vec<Time>>>,
-    last_predicted_time: (f64, Sender<Prediction>),
+    last_prediction: (u64, Sender<Prediction>),
+}
+
+struct FrameData {
+    /// Map from random projection to frame number
+    btree: Vec<BTreeMap<NotNan<f32>, u64>>,
+    /// Map from timestamp to index in frame_history and projections.
+    projections: HashMap<u64, (usize, Vec<f64>)>,
+    /// List of consecutive frame numbers
+    frames: Vec<u64>,
 }
 
 impl AudioProcessor for FftRenderer {
@@ -203,90 +214,146 @@ impl AudioProcessor for FftRenderer {
             .zip(inputs[0].channel_data(0).iter())
             .for_each(|(i, s)| *i = *s);
 
-        if self.fft_counter == 0 {
-            // TODO try scratch space, storing Fft after planning
-            do_fft(
-                &mut self.planner,
-                self.past_input.clone().make_contiguous(),
-                &mut self.data,
-            );
+        // TODO try scratch space, storing Fft after planning
+        do_fft(
+            &mut self.planner,
+            self.past_input.clone().make_contiguous(),
+            &mut self.data,
+        );
 
-            // TODO try benchmarking this (maybe put in a for loop so flamegraph can see)
-            let current_projections: Vec<_> = self
-                .random_vector
-                .iter()
-                .map(|v| random_project(&self.data, v) as f64)
-                .collect();
+        // TODO try benchmarking this (maybe put in a for loop so flamegraph can see)
+        // this is indeed some 68% of runtime. perhaps reduce dimensions
+        let current_projections: Vec<_> = self
+            .random_vector
+            .iter()
+            .map(|v| random_project(&self.data, v) as f64)
+            .collect();
+        let current_frame_index = {
+            self.frame_data.frames.push(scope.current_frame);
+            self.frame_data.frames.len() - 1
+        };
 
-            // Find the best guess among neighbors.
-            if let Some(best_guess) = current_projections
-                .iter()
-                .zip(self.btree.iter_mut())
-                .flat_map(|(p, b)| {
-                    let projection = NotNan::new(*p as f32).unwrap();
-                    let neighbors = b
-                        .range(..projection)
-                        .last()
-                        .map(|(_, t)| *t)
-                        .into_iter()
-                        .chain(b.range(projection..).next().map(|(_, t)| *t));
-                    // Note: this is a side effect, updating btrees.
-                    // Thus, this line *needs* to be after searching for neighbors.
-                    b.insert(projection, scope.current_time);
-                    neighbors
-                })
-                .map(|n_time| {
-                    // Using sum squared error over all projections.
-                    let neighbor_projections = self
-                        .projections
-                        .get(&NotNan::new(n_time).unwrap())
-                        .expect("past time should have entry");
-                    (
-                        NotNan::new(
-                            (neighbor_projections
-                                .iter()
-                                .zip(current_projections.iter())
-                                .map(|(n, c)| (n - c).powi(2))
-                                .sum::<f64>()
-                                / current_projections.len() as f64)
-                                .sqrt(),
-                        )
-                        .unwrap()
-                            + if (scope.current_time - n_time) < PENALTY_TIME {
-                                // Add some error for nearby times
-                                PENALTY
-                            } else {
-                                0.0
-                            }
-                            - if (scope.current_time - self.last_predicted_time.0) < BONUS_TIME {
-                                // Decrease error for times near last predicted time
-                                BONUS
-                            } else {
-                                0.0
-                            },
-                        n_time,
+        self.frame_data.projections.insert(
+            scope.current_frame,
+            (current_frame_index, current_projections.clone()),
+        );
+
+        // Find the best guess among neighbors.
+        if let Some((error, best_frame)) = current_projections
+            .iter()
+            .zip(self.frame_data.btree.iter_mut())
+            .flat_map(|(p, b)| {
+                let projection = NotNan::new(*p as f32).unwrap();
+                b.insert(projection, scope.current_frame);
+                let neighbors = b
+                    .range(..projection)
+                    // TODO remove (hacky). find better way of penalizing.
+                    .filter(|(_, n_f)| (scope.current_frame - *n_f) > PENALTY_FRAME)
+                    .rev()
+                    .take(NEIGHBOR_COUNT)
+                    .chain(
+                        // Make sure not to include the *just* inserted projection.
+                        b.range((Excluded(projection), Unbounded))
+                            .filter(|(_, n_f)| (scope.current_frame - *n_f) > PENALTY_FRAME)
+                            .take(NEIGHBOR_COUNT),
                     )
-                })
-                .min_by_key(|(error, _)| *error)
-            {
+                    .map(|(_, t)| *t);
+                neighbors
+            })
+            .map(|n_frame| -> (NotNan<f64>, u64) {
+                // Using sum squared error over all projections.
+                (
+                    NotNan::new(calculate_error(
+                        &self.frame_data.projections,
+                        &self.frame_data.frames,
+                        n_frame,
+                        scope.current_frame,
+                    ))
+                    .unwrap(),
+                    n_frame,
+                )
+            })
+            .min_by_key(|(error, _)| *error)
+        {
+            if *error <= 20.0 {
+                let predicted_time = best_frame as f64 / self.sample_rate;
                 self.times.lock().unwrap().push(Time {
                     real: scope.current_time,
-                    predicted: best_guess.1,
+                    predicted: predicted_time,
                     projection: current_projections.clone(),
+                    error: *error,
                 });
-                self.last_predicted_time.0 = best_guess.1;
-                let _ = self.last_predicted_time.1.send(Prediction {
-                    predicted_time: best_guess.1,
+                self.last_prediction.0 = best_frame;
+                let _ = self.last_prediction.1.send(Prediction {
+                    predicted_time,
                     time_of_prediction: scope.current_time,
                 });
             }
-            self.projections
-                .insert(scope.current_time.try_into().unwrap(), current_projections);
         }
-        self.fft_counter += 1;
-        self.fft_counter %= self.fft_run_interval;
+
         false
     }
+}
+
+fn calculate_error(
+    projections: &HashMap<u64, (usize, Vec<f64>)>,
+    frames: &[u64],
+    neighbor_frame: u64,
+    current_frame: u64,
+) -> f64 {
+    // Using sum squared error over all projections.
+
+    let current_index = projections
+        .get(&current_frame)
+        .expect("should have stored current frame's projection")
+        .0;
+    let neighbor_index = projections
+        .get(&neighbor_frame)
+        .expect("should have neighbor's projection")
+        .0;
+
+    // Since we don't know (may change across web_audio_api versions) the quantum length,
+    // we just search backwards until we get enough frames (or run out of samples)
+    let it = frames[..=neighbor_index]
+        .iter()
+        .rev()
+        .zip(frames[..=current_index].iter().rev())
+        .take(ERROR_FRAME_HISTORY_COUNT as usize)
+        .flat_map(|(n_i, c_i)| {
+            projections
+                .get(n_i)
+                .unwrap()
+                .1
+                .iter()
+                .zip(projections.get(c_i).unwrap().1.iter())
+        })
+        .map(|(n, c)| (n - c).powi(2));
+    assert_ne!(
+        it.clone().count(),
+        0,
+        "Number of comparable frames should never be 0."
+    );
+    (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
+    // let frame_delta = current_frame.abs_diff(neighbor_frame);
+
+    // if frame_delta < PENALTY_FRAME {
+    //     // Scale by log so positive infinity near current frames, and PENALTY near PENALTY_FRAME
+    //     // Add 1 to avoid logarithm of 0.
+    //     let ratio = (frame_delta + 1) as f64 / (PENALTY_FRAME + 1) as f64;
+    //     // Add 1 to make value PENALTY near PENALTY_FRAME
+    //     let penalty = PENALTY * (ratio.log10().abs() + 1.);
+    //     assert!(penalty >= PENALTY, "{}", penalty);
+    //     // Add some error for nearby times
+    //     error += penalty;
+    // }
+
+    // TODO handle last predicted time
+    // if (current_frame - self.last_predicted_time.0) < BONUS_FRAME {
+    //     // Decrease error for times near last predicted time
+    //     error -= BONUS
+    // }
+
+    // error
 }
 
 struct PlaybackNode {
