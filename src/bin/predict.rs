@@ -11,17 +11,24 @@ use rand::SeedableRng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::{AudioContext, AudioContextRegistration, BaseAudioContext};
+use web_audio_api::media_devices::MediaStreamConstraints;
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
 use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
-use web_audio_api::AudioBuffer;
+use web_audio_api::{media_devices, AudioBuffer};
 
 use fft::{
-    do_fft, load_file, random_project, Time, BONUS, BONUS_FRAME, DURATION, FFT_LEN, PENALTY,
-    PENALTY_FRAME, REPEATS, SEARCH_DIMENSIONS,
+    do_fft, load_file, random_project, RandomVector, Time, BONUS, BONUS_FRAME, DURATION, FFT_LEN,
+    PENALTY, PENALTY_FRAME, REPEATS, SEARCH_DIMENSIONS,
 };
 
+/// How many previous frames of projections to look at when calculating sum
+/// squared error.
+const ERROR_FRAME_HISTORY_COUNT: u64 = 16;
 /// Neighbor count per side per projection
-const NEIGHBOR_COUNT: usize = 1;
+const NEIGHBOR_COUNT: usize = 5;
+
+/// Assumed render quantum size
+const QUANTUM_SIZE: usize = 128;
 
 fn main() {
     let output_file = std::env::args()
@@ -49,6 +56,7 @@ fn main() {
         // generate_varying_sine(&context, DURATION),
     );
     src.set_loop(true);
+    src.start();
 
     let fft = FftNode::new(&context, FftOptions { fft_len: FFT_LEN });
     let (fft, prediction_rx) = fft.consume_receiver();
@@ -56,7 +64,7 @@ fn main() {
 
     let left_panner = context.create_stereo_panner();
     left_panner.connect(&context.destination());
-    left_panner.pan().set_value(-1.);
+    left_panner.pan().set_value(1.);
 
     let context = Arc::new(context);
     let playback = PlaybackNode::new(context.clone(), PlaybackOptions { prediction_rx });
@@ -64,11 +72,10 @@ fn main() {
 
     let right_panner = context.create_stereo_panner();
     right_panner.connect(&context.destination());
-    right_panner.pan().set_value(1.);
+    right_panner.pan().set_value(-1.);
     src.connect(&right_panner);
     playback.connect(&left_panner);
 
-    src.start();
     // enjoy listening
     std::thread::sleep(std::time::Duration::from_secs_f32(
         DURATION * REPEATS as f32,
@@ -97,15 +104,16 @@ impl FftNode<Receiver<Prediction>> {
             // Deterministic for reproducibility.
             let mut rng = rand::rngs::SmallRng::seed_from_u64(0xDEADBEEF);
             let mut gen_random_vector = || {
-                let mut vec = (0..(options.fft_len))
-                    .map(|_| rng.gen_range(-1.0..1.0))
-                    .collect::<Vec<f32>>();
+                let mut vec = (0..(options.fft_len / 2 + 1))
+                    .map(|_| rng.gen_range(-1.0_f32..1.0))
+                    .collect::<Vec<_>>();
                 // Normalize to unit.
                 let magnitude = vec.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
                 for el in &mut vec {
-                    *el /= magnitude
+                    *el /= magnitude;
                 }
-                vec
+
+                RandomVector { points: vec }
             };
             // Set exact size of backing buffer.
             let mut past_input: VecDeque<_> = vec![].into();
@@ -129,6 +137,7 @@ impl FftNode<Receiver<Prediction>> {
                 },
                 times: times.clone(),
                 last_prediction: (0, tx),
+                prediction_manager: PredictionManager { data: vec![] },
             };
             let node = FftNode {
                 registration,
@@ -178,10 +187,11 @@ struct FftRenderer {
     past_input: VecDeque<f32>,
     data: Vec<Complex<f32>>,
     planner: RealFftPlanner<f32>,
-    random_vector: Vec<Vec<f32>>,
+    random_vector: Vec<RandomVector>,
     frame_data: FrameData,
     times: Arc<Mutex<Vec<Time>>>,
     last_prediction: (u64, Sender<Prediction>),
+    prediction_manager: PredictionManager,
 }
 
 struct FrameData {
@@ -262,6 +272,7 @@ impl AudioProcessor for FftRenderer {
                 (
                     NotNan::new(calculate_error(
                         &self.frame_data.projections,
+                        &self.frame_data.frames,
                         n_frame,
                         scope.current_frame,
                     ))
@@ -271,18 +282,27 @@ impl AudioProcessor for FftRenderer {
             })
             .min_by_key(|(error, _)| *error)
         {
-            if *error <= 20.0 {
+            // TODO do something more reasonable. this prevents random new predictions
+            if *error <= 18.0 {
                 let predicted_time = best_frame as f64 / self.sample_rate;
+                let prediction = Prediction {
+                    predicted_time,
+                    time_of_prediction: scope.current_time,
+                };
+                self.prediction_manager.add_prediction(prediction);
+                let prediction = Prediction {
+                    predicted_time: self.prediction_manager.get_prediction(scope.current_time),
+                    time_of_prediction: scope.current_time,
+                };
+                let _ = self.last_prediction.1.send(prediction.clone());
+                self.last_prediction.0 = best_frame;
+
                 self.times.lock().unwrap().push(Time {
                     real: scope.current_time,
                     predicted: predicted_time,
                     projection: current_projections.clone(),
                     error: *error,
-                });
-                self.last_prediction.0 = best_frame;
-                let _ = self.last_prediction.1.send(Prediction {
-                    predicted_time,
-                    time_of_prediction: scope.current_time,
+                    managed_prediction: prediction.predicted_time,
                 });
             }
         }
@@ -293,20 +313,55 @@ impl AudioProcessor for FftRenderer {
 
 fn calculate_error(
     projections: &HashMap<u64, (usize, Vec<f64>)>,
+    frames: &[u64],
     neighbor_frame: u64,
     current_frame: u64,
 ) -> f64 {
     // Using sum squared error over all projections.
-
-    let it = projections
+    let current_index = projections
+        .get(&current_frame)
+        .expect("should have stored current frame's projection")
+        .0;
+    let neighbor_index = projections
         .get(&neighbor_frame)
-        .unwrap()
-        .1
+        .expect("should have neighbor's projection")
+        .0;
+
+    // Take the frames such that their FFT's don't overlap
+    let it = frames[..=neighbor_index]
         .iter()
-        .zip(projections.get(&current_frame).unwrap().1.iter())
+        .rev()
+        .step_by(FFT_LEN / QUANTUM_SIZE)
+        .zip(
+            frames[..=current_index]
+                .iter()
+                .rev()
+                .step_by(FFT_LEN / QUANTUM_SIZE),
+        )
+        .take(ERROR_FRAME_HISTORY_COUNT as usize)
+        .flat_map(|(n_i, c_i)| {
+            projections
+                .get(n_i)
+                .unwrap()
+                .1
+                .iter()
+                .zip(projections.get(c_i).unwrap().1.iter())
+        })
         .map(|(n, c)| (n - c).powi(2));
+    assert_ne!(
+        it.clone().count(),
+        0,
+        "Number of comparable frames should never be 0."
+    );
+
     (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
+
     // let frame_delta = current_frame.abs_diff(neighbor_frame);
+
+    // // Add a bias towards more recent samples.
+    // // 4410000 => about 1 additional error every 100 seconds.
+    // // TODO make into a constant
+    // error + (current_frame - neighbor_frame) as f64 / 4_410_000.
 
     // if frame_delta < PENALTY_FRAME {
     //     // Scale by log so positive infinity near current frames, and PENALTY near PENALTY_FRAME
@@ -379,6 +434,7 @@ struct PlaybackRenderer {
     prediction: Receiver<Prediction>,
 }
 
+#[derive(Clone)]
 struct Prediction {
     predicted_time: f64,
     time_of_prediction: f64,
@@ -389,6 +445,47 @@ struct ResizingBuffer {
     used: usize,
     start_time: f64,
     playback_index: usize,
+}
+
+/// Avoid skipping back and forth rapidly.
+struct PredictionManager {
+    data: Vec<(f64, u64)>,
+}
+
+impl PredictionManager {
+    /// The range in which two timestamps are considered close enough to be the same prediction.
+    const EQUAL_WINDOW: f64 = 1.0;
+    const DECAY_RATIO: (u64, u64) = (7, 8);
+    const INCREMENT: u64 = 1;
+
+    fn add_prediction(&mut self, prediction: Prediction) {
+        let normalized_time = prediction.predicted_time - prediction.time_of_prediction;
+        let mut found = false;
+        for (time, count) in &mut self.data {
+            // 1 second window
+            if (*time - normalized_time).abs() < Self::EQUAL_WINDOW {
+                // Recalculate the prediction, using the count as a weight.
+                *time = (*time * *count as f64 + normalized_time) / (*count + 1) as f64;
+                *count += Self::INCREMENT;
+                found = true;
+            } else {
+                *count = (*count * Self::DECAY_RATIO.0) / Self::DECAY_RATIO.1;
+            }
+        }
+        if found {
+            return;
+        }
+        self.data.push((normalized_time, 1));
+    }
+
+    fn get_prediction(&self, current_time: f64) -> f64 {
+        self.data
+            .iter()
+            .max_by_key(|d| d.1)
+            .map(|d| d.0)
+            .unwrap_or(0.0)
+            + current_time
+    }
 }
 
 impl ResizingBuffer {
@@ -462,6 +559,7 @@ impl AudioProcessor for PlaybackRenderer {
             // Account for possible elapsed time between sending and receiving.
             let updated_time = (scope.current_time - new_prediction.time_of_prediction)
                 + new_prediction.predicted_time;
+
             self.past_data
                 .try_set_time(updated_time, inputs[0].channel_data(0).len());
         }

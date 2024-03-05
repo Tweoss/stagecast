@@ -5,14 +5,14 @@ use web_audio_api::AudioBuffer;
 
 pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
 // pub const DURATION: f32 = 10.;
-pub const DURATION: f32 = 13. * 60. + 4.;
+pub const DURATION: f32 = 13. * 60.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
-pub const FFT_LEN: usize = 2usize.pow(16);
+pub const FFT_LEN: usize = 2usize.pow(15);
 /// How close a frame should be to apply a penalty.
 // pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
-pub const PENALTY_FRAME: u64 = 44100 * 2;
+pub const PENALTY_FRAME: u64 = 44100 * 8;
 pub const PENALTY: f64 = 10.0;
 /// How close a new predicted frame must be to the last predicted time to get a bonus.
 pub const BONUS_FRAME: u64 = 100;
@@ -29,6 +29,7 @@ pub struct Time {
     pub predicted: f64,
     pub projection: Vec<f64>,
     pub error: f64,
+    pub managed_prediction: f64,
 }
 
 pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut [Complex<f32>]) {
@@ -54,15 +55,17 @@ pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut
     r2c.process(input, output).unwrap();
 }
 
-pub fn random_project(input: &[Complex<f32>], projection: &[f32]) -> f32 {
-    // TODO since ignoring angle, reduce projection vector size
-    assert!(input.len() == projection.len() / 2 + 1);
+pub struct RandomVector {
+    pub points: Vec<f32>,
+}
+
+pub fn random_project(input: &[Complex<f32>], projection: &RandomVector) -> f32 {
+    assert!(input.len() == projection.points.len());
     input
         .iter()
+        // atan is a very expensive operation so we just use magnitude not phase shift
         .map(|v| v.norm_sqr().sqrt())
-        // atan is a very expensive operation
-        // .flat_map(|v| [v.norm_sqr().sqrt(), v.atan().re])
-        .zip(projection.iter())
+        .zip(projection.points.iter())
         .map(|(a, b)| a * b)
         .sum::<f32>()
 }
