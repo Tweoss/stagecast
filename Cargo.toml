@@ -10,6 +10,13 @@ name = "fft"
 path = "src/lib.rs"
 
 [dependencies]
+egui = "0.26.0"
+eframe = { version = "0.26.0", default-features = false, features = [
+    "default_fonts", # Embed the default egui fonts.
+    "glow",          # Use the glow rendering backend. Alternative: "wgpu".
+    "persistence",   # Enable restoring app state when restarting the app.
+] }
+egui_plot = "0.26.0"
 ordered-float = { version = "4.0", default-features = false }
 plotters = "0.3.3"
 rand = { version = "0.8.5", features = [ "small_rng" ] }

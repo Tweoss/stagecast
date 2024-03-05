@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
@@ -12,15 +13,14 @@ use rand::SeedableRng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::{AudioContext, AudioContextRegistration, BaseAudioContext};
-use web_audio_api::media_devices::MediaStreamConstraints;
 use web_audio_api::media_recorder::MediaRecorder;
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
 use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
-use web_audio_api::{media_devices, AudioBuffer};
+use web_audio_api::AudioBuffer;
 
 use fft::{
-    do_fft, load_file, random_project, RandomVector, Time, BONUS, BONUS_FRAME, DURATION, FFT_LEN,
-    PENALTY, PENALTY_FRAME, REPEATS, SEARCH_DIMENSIONS,
+    do_fft, load_file, random_project, RandomVector, Time, DURATION, FFT_LEN, PENALTY_FRAME,
+    QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
 };
 
 /// How many previous frames of projections to look at when calculating sum
@@ -29,17 +29,19 @@ const ERROR_FRAME_HISTORY_COUNT: u64 = 16;
 /// Neighbor count per side per projection
 const NEIGHBOR_COUNT: usize = 5;
 
-/// Assumed render quantum size
-const QUANTUM_SIZE: usize = 128;
+/// Injected latency in seconds.
+const ARTIFICAL_LATENCY: f64 = 50.0 / 1000.0;
 
 fn main() {
     let output_file = std::env::args()
         .nth(1)
         .expect("pass the output json path as an argument");
 
-    // let context = OfflineAudioContext::new(1, 44100 * DURATION as usize, 44100.0);
     let context = AudioContext::default();
 
+    // Take source from microphone.
+    // use web_audio_api::media_devices;
+    // use web_audio_api::media_devices::MediaStreamConstraints;
     // let mic = media_devices::get_user_media_sync(MediaStreamConstraints::Audio);
     // // register as media element in the audio context
     // let src = context.create_media_stream_source(&mic);
@@ -53,6 +55,7 @@ fn main() {
             DURATION,
             // "/Users/francischua/Downloads/sample2.ogg".to_owned(),
             "/Users/francischua/Downloads/ladispute_amp.ogg".to_owned(),
+            // "/Users/francischua/Downloads/turkishmarch.ogg".to_owned(),
         ),
         // or generate a sample (escalating chord stack)
         // generate_varying_sine(&context, DURATION),
@@ -68,9 +71,12 @@ fn main() {
     left_panner.connect(&context.destination());
     left_panner.pan().set_value(1.);
 
+    let delay = context.create_delay(ARTIFICAL_LATENCY);
+    src.connect(&delay);
+
     let context = Arc::new(context);
     let playback = PlaybackNode::new(context.clone(), PlaybackOptions { prediction_rx });
-    src.connect(&playback);
+    delay.connect(&playback);
 
     let right_panner = context.create_stereo_panner();
     right_panner.connect(&context.destination());
@@ -247,8 +253,6 @@ impl AudioProcessor for FftRenderer {
             &mut self.data,
         );
 
-        // TODO try benchmarking this (maybe put in a for loop so flamegraph can see)
-        // this is indeed some 68% of runtime. perhaps reduce dimensions
         let current_projections: Vec<_> = self
             .random_vector
             .iter()
@@ -265,6 +269,7 @@ impl AudioProcessor for FftRenderer {
         );
 
         // Find the best guess among neighbors.
+        // TODO: try R-tree
         if let Some((error, best_frame)) = current_projections
             .iter()
             .zip(self.frame_data.btree.iter_mut())
@@ -294,6 +299,7 @@ impl AudioProcessor for FftRenderer {
                         &self.frame_data.frames,
                         n_frame,
                         scope.current_frame,
+                        self.last_prediction.0,
                     ))
                     .unwrap(),
                     n_frame,
@@ -301,40 +307,36 @@ impl AudioProcessor for FftRenderer {
             })
             .min_by_key(|(error, _)| *error)
         {
-            // TODO do something more reasonable. this prevents random new predictions
-            if *error <= 18.0 {
-                let predicted_time = best_frame as f64 / self.sample_rate;
-                let prediction = Prediction {
-                    predicted_time,
-                    time_of_prediction: scope.current_time,
-                };
-                self.prediction_manager.add_prediction(prediction);
-                let prediction = Prediction {
-                    predicted_time: self.prediction_manager.get_prediction(scope.current_time),
-                    time_of_prediction: scope.current_time,
-                };
-                let _ = self.last_prediction.1.send(prediction.clone());
-                self.last_prediction.0 = best_frame;
+            let predicted_time = best_frame as f64 / self.sample_rate;
+            self.prediction_manager
+                .add_prediction(predicted_time, scope.current_time);
+            let (frame, prediction) = self
+                .prediction_manager
+                .get_prediction(scope.current_time, self.sample_rate);
+            let _ = self.last_prediction.1.send(prediction.clone());
+            self.last_prediction.0 = frame;
 
-                self.times.lock().unwrap().push(Time {
-                    real: scope.current_time,
-                    predicted: predicted_time,
-                    projection: current_projections.clone(),
-                    error: *error,
-                    managed_prediction: prediction.predicted_time,
-                });
-            }
+            self.times.lock().unwrap().push(Time {
+                real: scope.current_time,
+                predicted: predicted_time,
+                projection: current_projections.clone(),
+                error: *error,
+                managed_prediction: prediction.predicted_time,
+            });
         }
 
         false
     }
 }
 
+// TODO: perhaps weight more recent times more heavily
+// TODO: use r-trees?
 fn calculate_error(
     projections: &HashMap<u64, (usize, Vec<f64>)>,
     frames: &[u64],
     neighbor_frame: u64,
     current_frame: u64,
+    last_prediction: u64,
 ) -> f64 {
     // Using sum squared error over all projections.
     let current_index = projections
@@ -350,12 +352,12 @@ fn calculate_error(
     let it = frames[..=neighbor_index]
         .iter()
         .rev()
-        .step_by(FFT_LEN / QUANTUM_SIZE)
+        .step_by(FFT_LEN / QUANTUM_SIZE as usize)
         .zip(
             frames[..=current_index]
                 .iter()
                 .rev()
-                .step_by(FFT_LEN / QUANTUM_SIZE),
+                .step_by(FFT_LEN / QUANTUM_SIZE as usize),
         )
         .take(ERROR_FRAME_HISTORY_COUNT as usize)
         .flat_map(|(n_i, c_i)| {
@@ -367,13 +369,12 @@ fn calculate_error(
                 .zip(projections.get(c_i).unwrap().1.iter())
         })
         .map(|(n, c)| (n - c).powi(2));
+
     assert_ne!(
         it.clone().count(),
         0,
         "Number of comparable frames should never be 0."
     );
-
-    (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
 
     // let frame_delta = current_frame.abs_diff(neighbor_frame);
 
@@ -393,13 +394,13 @@ fn calculate_error(
     //     error += penalty;
     // }
 
-    // TODO handle last predicted time
-    // if (current_frame - self.last_predicted_time.0) < BONUS_FRAME {
+    // // TODO handle last predicted time
+    // if last_prediction.abs_diff(neighbor_frame) < BONUS_FRAME {
     //     // Decrease error for times near last predicted time
-    //     error -= BONUS
+    //     error /= BONUS
     // }
 
-    // error
+    (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
 }
 
 struct PlaybackNode {
@@ -468,36 +469,62 @@ struct ResizingBuffer {
 
 /// Avoid skipping back and forth rapidly.
 struct PredictionManager {
-    data: Vec<(f64, u64)>,
+    data: Vec<(f64, NotNan<f64>)>,
 }
 
 impl PredictionManager {
     /// The range in which two timestamps are considered close enough to be the same prediction.
     const EQUAL_WINDOW: f64 = 1.0;
-    const DECAY_RATIO: (u64, u64) = (7, 8);
-    const INCREMENT: u64 = 1;
+    const DECAY_RATIO: f64 = 21.0 / 22.0;
+    const INCREMENT: f64 = 1.0;
 
-    fn add_prediction(&mut self, prediction: Prediction) {
-        let normalized_time = prediction.predicted_time - prediction.time_of_prediction;
-        let mut found = false;
+    /// Returns a prediction and the closest frame that matches that prediction.
+    /// Assumes that frames are always divisible by QUANTUM_SIZE.
+    fn add_prediction(&mut self, predicted_time: f64, current_time: f64) {
+        let normalized_time = predicted_time - current_time;
+        let mut found_match = false;
         for (time, count) in &mut self.data {
             // 1 second window
             if (*time - normalized_time).abs() < Self::EQUAL_WINDOW {
+                // TODO: just rewrite?
+                // *time = **count;
                 // Recalculate the prediction, using the count as a weight.
-                *time = (*time * *count as f64 + normalized_time) / (*count + 1) as f64;
+                *time = (*time * **count + normalized_time) / (**count + 1.0);
                 *count += Self::INCREMENT;
-                found = true;
+                found_match = true;
             } else {
-                *count = (*count * Self::DECAY_RATIO.0) / Self::DECAY_RATIO.1;
+                *count *= Self::DECAY_RATIO;
             }
         }
-        if found {
-            return;
+
+        if !found_match {
+            self.data.push((normalized_time, NotNan::new(1.0).unwrap()));
         }
-        self.data.push((normalized_time, 1));
+
+        let best_time = self.get_best_time(current_time);
+        // Remove everything (except the best time) with a counter value less than 1.
+        self.data
+            .retain(|(t, c)| **c >= 1.0 && t.partial_cmp(&best_time) != Some(Ordering::Equal));
     }
 
-    fn get_prediction(&self, current_time: f64) -> f64 {
+    fn get_prediction(&self, current_time: f64, sample_rate: f64) -> (u64, Prediction) {
+        let best_time = self.get_best_time(current_time);
+
+        (
+            Self::round_to_frame(best_time, sample_rate),
+            Prediction {
+                predicted_time: best_time,
+                time_of_prediction: current_time,
+            },
+        )
+    }
+
+    /// Assumes that frames are always divisible by QUANTUM_SIZE.
+    fn round_to_frame(time: f64, sample_rate: f64) -> u64 {
+        (time * sample_rate / QUANTUM_SIZE as f64).round() as u64 * QUANTUM_SIZE
+    }
+
+    fn get_best_time(&self, current_time: f64) -> f64 {
         self.data
             .iter()
             .max_by_key(|d| d.1)
@@ -577,7 +604,8 @@ impl AudioProcessor for PlaybackRenderer {
         if let Ok(new_prediction) = self.prediction.try_recv() {
             // Account for possible elapsed time between sending and receiving.
             let updated_time = (scope.current_time - new_prediction.time_of_prediction)
-                + new_prediction.predicted_time;
+                + new_prediction.predicted_time
+                + ARTIFICAL_LATENCY;
 
             self.past_data
                 .try_set_time(updated_time, inputs[0].channel_data(0).len());

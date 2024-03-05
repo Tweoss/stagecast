@@ -5,6 +5,9 @@ use web_audio_api::AudioBuffer;
 
 pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
 // pub const DURATION: f32 = 10.;
+// Turkish March
+// pub const DURATION: f32 = 2. * 60. + 40.;
+// La Dispute
 pub const DURATION: f32 = 13. * 60.;
 pub const REPEATS: usize = 1;
 // TODO check best value
@@ -14,14 +17,16 @@ pub const FFT_LEN: usize = 2usize.pow(15);
 // pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
 pub const PENALTY_FRAME: u64 = 44100 * 8;
 pub const PENALTY: f64 = 10.0;
+/// Assumed render quantum size
+pub const QUANTUM_SIZE: u64 = 128;
 /// How close a new predicted frame must be to the last predicted time to get a bonus.
-pub const BONUS_FRAME: u64 = 100;
-/// The amount of artificial decrease in error.
-pub const BONUS: f64 = 100.0;
+pub const BONUS_FRAME: u64 = QUANTUM_SIZE * 10;
+/// The ratio of artificial decrease in error.
+pub const BONUS: f64 = 2.0;
 
 /// How many samples from the start and ends of the fft input
 /// to smooth down. Reduces noise in fft output.
-const SMOOTHING_COUNT: usize = 128 * 5;
+const SMOOTHING_COUNT: usize = QUANTUM_SIZE as usize * 5;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Time {
@@ -79,9 +84,6 @@ pub fn generate_varying_sine(context: &impl BaseAudioContext, duration: f32) -> 
 
     // Fill buffer with a varying sine wave
     let mut sine = vec![];
-
-    // Test with constant pitch.
-    // let (start, end) = (440.0, 440.0);
 
     // Vary pitch from A, to A
     let (start, end) = (220.0, 440.0);
