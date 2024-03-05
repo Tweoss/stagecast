@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::File;
+use std::io::Write;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Unbounded;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,6 +13,7 @@ use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::{AudioContext, AudioContextRegistration, BaseAudioContext};
 use web_audio_api::media_devices::MediaStreamConstraints;
+use web_audio_api::media_recorder::MediaRecorder;
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
 use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
 use web_audio_api::{media_devices, AudioBuffer};
@@ -76,10 +78,27 @@ fn main() {
     src.connect(&right_panner);
     playback.connect(&left_panner);
 
+    let output = context.create_media_stream_destination();
+    let recorder = MediaRecorder::new(output.stream());
+    context.destination().connect(&output);
+    let recording = Box::<Arc<_>>::leak(Box::new(Arc::new(Mutex::new(Vec::new()))));
+    recorder.set_ondataavailable(|mut event| {
+        recording.lock().unwrap().append(&mut event.blob);
+    });
+    recorder.set_onstop(|_| {
+        File::create("output/recording.wav")
+            .unwrap()
+            .write_all(&recording.lock().unwrap())
+            .unwrap();
+    });
+    recorder.start();
+
     // enjoy listening
     std::thread::sleep(std::time::Duration::from_secs_f32(
         DURATION * REPEATS as f32,
     ));
+
+    recorder.stop();
 
     let times = fft.times.lock().unwrap().to_vec();
     serde_json::to_writer(&File::create(output_file).unwrap(), &times).unwrap();
