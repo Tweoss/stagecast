@@ -8,7 +8,9 @@ pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
 // Turkish March
 // pub const DURATION: f32 = 2. * 60. + 40.;
 // La Dispute
-pub const DURATION: f32 = 13. * 60.;
+// pub const DURATION: f32 = 13. * 60.;
+// Stravinsky
+pub const DURATION: f32 = 2. * 60. + 15.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
@@ -58,6 +60,8 @@ pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut
 
     // forward transform the signal
     r2c.process(input, output).unwrap();
+
+    output.iter_mut().for_each(|o| *o /= (length as f32).sqrt());
 }
 
 pub struct RandomVector {
