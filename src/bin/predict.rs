@@ -1,9 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Unbounded;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -33,9 +34,10 @@ const NEIGHBOR_COUNT: usize = 5;
 const ARTIFICAL_LATENCY: f64 = 50.0 / 1000.0;
 
 fn main() {
-    let output_file = std::env::args()
+    let output_dir = std::env::args()
         .nth(1)
-        .expect("pass the output json path as an argument");
+        .expect("pass the output directory path as an argument");
+    fs::create_dir(&output_dir).expect("could not create output directory");
 
     let context = AudioContext::default();
 
@@ -54,8 +56,9 @@ fn main() {
             &context,
             DURATION,
             // "/Users/francischua/Downloads/sample2.ogg".to_owned(),
-            "/Users/francischua/Downloads/ladispute_amp.ogg".to_owned(),
+            // "/Users/francischua/Downloads/ladispute_amp.ogg".to_owned(),
             // "/Users/francischua/Downloads/turkishmarch.ogg".to_owned(),
+            "/Users/francischua/Downloads/stravinsky_cut.ogg".to_owned(),
         ),
         // or generate a sample (escalating chord stack)
         // generate_varying_sine(&context, DURATION),
@@ -91,12 +94,16 @@ fn main() {
     recorder.set_ondataavailable(|mut event| {
         recording.lock().unwrap().append(&mut event.blob);
     });
-    recorder.set_onstop(|_| {
-        File::create("output/recording.wav")
-            .unwrap()
-            .write_all(&recording.lock().unwrap())
-            .unwrap();
-    });
+    {
+        let recording = recording.clone();
+        let output_dir = output_dir.clone();
+        recorder.set_onstop(move |_| {
+            File::create(PathBuf::new().join(&output_dir).join("recording.wav"))
+                .unwrap()
+                .write_all(&recording.lock().unwrap())
+                .unwrap();
+        });
+    }
     recorder.start();
 
     // enjoy listening
@@ -107,7 +114,13 @@ fn main() {
     recorder.stop();
 
     let times = fft.times.lock().unwrap().to_vec();
-    serde_json::to_writer(&File::create(output_file).unwrap(), &times).unwrap();
+    serde_json::to_writer(
+        &File::create(PathBuf::new().join(&output_dir).join("data.json")).unwrap(),
+        &times,
+    )
+    .unwrap();
+
+    make_graph(&times, &PathBuf::new().join(&output_dir).join("graph.png"));
 }
 
 struct FftNode<PredictionType> {
@@ -618,4 +631,67 @@ impl AudioProcessor for PlaybackRenderer {
 
         false
     }
+}
+
+fn make_graph<P: AsRef<Path>>(data: &[Time], output_file: &P) {
+    use plotters::prelude::*;
+    // Debug info
+    let it = data
+        .iter()
+        .map(|t| NotNan::new(t.predicted - t.real).unwrap());
+    dbg!(it.clone().max());
+    dbg!(it.clone().min());
+    dbg!(it.clone().map(|f| *f).sum::<f64>() / it.count() as f64);
+    let it = data.iter().map(|t| NotNan::new(t.error).unwrap());
+    dbg!(it.clone().max());
+    dbg!(it.clone().min());
+    dbg!(it.clone().map(|f| *f).sum::<f64>() / it.count() as f64);
+
+    // Draw onto an image and output.
+    let root = BitMapBackend::new(&output_file, (1920, 1080)).into_drawing_area();
+    root.fill(&WHITE).unwrap();
+    let mut chart = ChartBuilder::on(&root)
+        .margin(5)
+        .x_label_area_size(30)
+        .y_label_area_size(30)
+        .build_cartesian_2d(
+            0.0..(DURATION as f64 * REPEATS as f64),
+            -8.2f64..(DURATION as f64 * REPEATS as f64),
+        )
+        .unwrap();
+
+    chart.configure_mesh().draw().unwrap();
+
+    chart
+        .draw_series(
+            data.iter()
+                .map(|t| Circle::new((t.real, t.predicted), 1, GREEN.mix(0.03))),
+        )
+        .unwrap()
+        .label("predicted")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], GREEN));
+
+    chart
+        .draw_series(
+            data.iter()
+                .map(|t| Circle::new((t.real, t.managed_prediction), 1, MAGENTA.mix(0.1))),
+        )
+        .unwrap()
+        .label("manager predicted")
+        .legend(|(x, y)| PathElement::new(vec![(x, y), (x + 20, y)], MAGENTA));
+    chart
+        .draw_series(
+            data.iter()
+                .map(|t| Circle::new((t.real, t.error), 1, RED.mix(0.1))),
+        )
+        .unwrap();
+
+    chart
+        .configure_series_labels()
+        .background_style(WHITE.mix(0.8))
+        .border_style(BLACK)
+        .draw()
+        .unwrap();
+
+    root.present().unwrap();
 }
