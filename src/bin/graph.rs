@@ -3,14 +3,13 @@ use std::{
     path::PathBuf,
 };
 
-use egui::{Color32, Key};
-use egui_plot::{HLine, Plot, Points, VLine};
+use egui::{Color32, Key, ViewportBuilder};
+use egui_plot::{HLine, Line, Plot, Points, VLine};
+use fft::{FftSample, Time, ASSUMED_SAMPLE_RATE};
 use ordered_float::NotNan;
-
-use fft::{Time, DURATION, REPEATS};
 use web_audio_api::{
     context::{AudioContext, BaseAudioContext},
-    node::{AudioBufferSourceNode, AudioNode, AudioScheduledSourceNode},
+    node::{AudioBufferSourceNode, AudioNode, AudioScheduledSourceNode, StereoPannerNode},
     AudioBuffer,
 };
 
@@ -20,6 +19,13 @@ fn main() {
         .expect("pass the input directory path as an argument");
     let data = fs::read_to_string(PathBuf::new().join(&input_directory).join("data.json")).unwrap();
     let data: Vec<Time> = serde_json::de::from_str(&data).unwrap();
+    let fft_samples = fs::read_to_string(
+        PathBuf::new()
+            .join(&input_directory)
+            .join("fft_samples.json"),
+    )
+    .unwrap();
+    let fft_samples: Vec<FftSample> = serde_json::de::from_str(&fft_samples).unwrap();
     // let data = data.iter().take(5_00).collect::<Vec<_>>();
 
     // Load recording.
@@ -31,12 +37,22 @@ fn main() {
 
     // Show interactive app to explore data.
     let native_options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default().with_maximized(true),
         ..Default::default()
     };
     eframe::run_native(
-        "data viewer",
+        &format!("Replay {}", &input_directory),
         native_options,
-        Box::new(|cc| Box::new(ViewingApp::new(cc, data, context, buffer))),
+        Box::new(|cc| {
+            Box::new(ViewingApp::new(
+                cc,
+                data,
+                fft_samples,
+                context,
+                buffer,
+                input_directory,
+            ))
+        }),
     )
     .unwrap();
 }
@@ -46,9 +62,11 @@ struct ViewingApp {
     projection: Vec<Vec<[f64; 2]>>,
     error: Vec<[f64; 2]>,
     managed_prediction: Vec<[f64; 2]>,
+    fft_samples: Vec<(f64, Vec<[f64; 2]>)>,
     show_settings: ShowSettings,
     context: AudioContext,
     audio: Audio,
+    directory_name: String,
 }
 
 struct ShowSettings {
@@ -72,8 +90,8 @@ impl Default for ShowSettings {
 }
 
 struct Audio {
-    real: (AudioBuffer, Option<AudioBufferSourceNode>),
-    predicted: (AudioBuffer, Option<AudioBufferSourceNode>),
+    real: (AudioBuffer, Option<AudioBufferSourceNode>, StereoPannerNode),
+    predicted: (AudioBuffer, Option<AudioBufferSourceNode>, StereoPannerNode),
 }
 
 impl Audio {
@@ -82,16 +100,20 @@ impl Audio {
             combination.get_channel_data(0),
             combination.get_channel_data(1),
         );
-        let make_buffer = |data: &[f32]| {
+        let make_buffer = |data: &[f32], panning: f32| {
             let mut buffer = context.create_buffer(1, data.len(), context.sample_rate());
             buffer.copy_to_channel(data, 0);
-            buffer
+            let panner = context.create_stereo_panner();
+            panner.connect(&context.destination());
+            panner.pan().set_value(panning);
+
+            (buffer, panner)
         };
-        let (real, predicted) = (make_buffer(real), make_buffer(predicted));
+        let (real, predicted) = (make_buffer(real, -1.0), make_buffer(predicted, 1.0));
 
         Self {
-            real: (real, None),
-            predicted: (predicted, None),
+            real: (real.0, None, real.1),
+            predicted: (predicted.0, None, predicted.1),
         }
     }
 
@@ -121,23 +143,31 @@ impl Audio {
                 self.predicted.1 = None;
             }
             (None, None) => {
-                let play_buffer =
-                    |buffer: AudioBuffer, should_sound: bool| -> AudioBufferSourceNode {
-                        let mut src = context.create_buffer_source();
-                        let duration = buffer.duration();
-                        src.set_buffer(buffer);
-                        if should_sound {
-                            src.connect(&context.destination());
-                        }
-                        src.start_at_with_offset(
-                            context.current_time(),
-                            start_time.clamp(0.0, duration),
-                        );
-                        src
-                    };
-                self.real.1 = Some(play_buffer(self.real.0.clone(), settings.real_sound));
+                let play_buffer = |buffer: AudioBuffer,
+                                   panner: &StereoPannerNode,
+                                   should_sound: bool|
+                 -> AudioBufferSourceNode {
+                    let mut src = context.create_buffer_source();
+                    let duration = buffer.duration();
+                    src.set_buffer(buffer);
+                    if should_sound {
+                        src.connect(panner);
+                        // src.connect(&context.destination());
+                    }
+                    src.start_at_with_offset(
+                        context.current_time(),
+                        start_time.clamp(0.0, duration),
+                    );
+                    src
+                };
+                self.real.1 = Some(play_buffer(
+                    self.real.0.clone(),
+                    &self.real.2,
+                    settings.real_sound,
+                ));
                 self.predicted.1 = Some(play_buffer(
                     self.predicted.0.clone(),
+                    &self.predicted.2,
                     settings.predicted_sound,
                 ));
             }
@@ -150,8 +180,10 @@ impl ViewingApp {
     pub fn new(
         _cc: &eframe::CreationContext<'_>,
         data: Vec<Time>,
+        fft_samples: Vec<FftSample>,
         context: AudioContext,
         combination_buffer: AudioBuffer,
+        directory_name: String,
     ) -> Self {
         // This is also where you can customize the look and feel of egui using
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
@@ -174,9 +206,29 @@ impl ViewingApp {
                 .collect(),
             error: select(real_iter.clone(), |t| t.error, &data),
             managed_prediction: select(real_iter.clone(), |t| t.managed_prediction, &data),
+            fft_samples: fft_samples
+                .iter()
+                .map(|s| {
+                    (
+                        s.real,
+                        s.magnitudes
+                            .iter()
+                            .enumerate()
+                            .rev()
+                            // Ignore the 10 highest frequencies
+                            .skip(10)
+                            // Map from period in number of samples to frequency in Hz
+                            .map(|(i, v)| {
+                                [(ASSUMED_SAMPLE_RATE as f64 / i as f64).log2(), *v as f64]
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect(),
             show_settings: ShowSettings::default(),
             audio: Audio::new(&context, combination_buffer),
             context,
+            directory_name,
         }
     }
 }
@@ -206,25 +258,34 @@ impl eframe::App for ViewingApp {
             ui.checkbox(&mut self.show_settings.predicted_sound, "Play Predicted");
         });
 
+        // egui::CentralPanel::default().show(ctx, |ui| {
+        let current_position = egui::TopBottomPanel::top("predictions")
+            .resizable(true)
+            .show(ctx, |ui| {
+                // The central panel the region left after adding TopPanel's and SidePanel's
+                ui.heading("Predictions");
+
+                ui.separator();
+
+                plot_data(ctx, ui, self)
+            })
+            .inner;
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // The central panel the region left after adding TopPanel's and SidePanel's
-            ui.heading("eframe template");
-
-            ui.separator();
-
-            plot(ctx, ui, self);
-
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                egui::warn_if_debug_build(ui);
-            });
+            ui.heading("FFT Samples");
+            plot_fft(ui, self, current_position);
         });
+        // });
     }
 }
 
-fn plot(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) {
-    let transform = Plot::new("custom_axes")
+// Return the position of the cursor in plot space or the current playback time.
+fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f64 {
+    let response = &mut Plot::new("data_plot")
         .include_x(0.0)
         .include_y(0.0)
+        .x_axis_label("real time")
+        .y_axis_label("predicted time")
         .show(ui, |plot_ui| {
             if app.show_settings.predicted.1 {
                 plot_ui.points(
@@ -244,10 +305,10 @@ fn plot(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) {
                 plot_ui.hline(HLine::new(*playback_position));
                 plot_ui.vline(VLine::new(*playback_position));
             }
-        })
-        .transform;
+        });
+    let transform = response.transform;
 
-    if let Some(pointer_pos) = ui.input(|i| i.pointer.hover_pos()) {
+    if let Some(pointer_pos) = response.response.hover_pos() {
         let start_time = if ui.input_mut(|i| i.key_pressed(Key::Space) && i.modifiers.shift_only())
         {
             Some(transform.value_from_position(pointer_pos).y)
@@ -261,4 +322,34 @@ fn plot(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) {
                 .toggle_play(&app.context, start_time, &app.show_settings);
         }
     }
+
+    if let (Some(pointer_pos), true) = (
+        response.response.hover_pos(),
+        app.audio.get_position().is_none(),
+    ) {
+        transform.value_from_position(pointer_pos).x
+    } else {
+        app.audio.get_position().unwrap_or(0.0)
+    }
+}
+
+fn plot_fft(ui: &mut egui::Ui, app: &mut ViewingApp, current_position: f64) {
+    Plot::new("fft_plot")
+        .x_axis_label("Frequency (Hz)")
+        .y_axis_label("Amplitude")
+        .include_x(880.0)
+        .include_y(10.0)
+        .data_aspect(30.0 / 20.0)
+        .show(ui, |plot_ui| {
+            let closest_index = app
+                .fft_samples
+                .binary_search_by_key(&NotNan::new(current_position).unwrap(), |s| {
+                    NotNan::new(s.0).unwrap()
+                });
+            let closest_index = match closest_index {
+                Ok(i) => i,
+                Err(i) => i,
+            };
+            plot_ui.line(Line::new(app.fft_samples[closest_index].1.clone()));
+        });
 }

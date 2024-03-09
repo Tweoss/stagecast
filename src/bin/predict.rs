@@ -14,14 +14,15 @@ use rand::SeedableRng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::{AudioContext, AudioContextRegistration, BaseAudioContext};
+use web_audio_api::media_devices::MediaStreamConstraints;
 use web_audio_api::media_recorder::MediaRecorder;
 use web_audio_api::node::{AudioNode, AudioScheduledSourceNode, ChannelConfig};
 use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
-use web_audio_api::AudioBuffer;
+use web_audio_api::{media_devices, AudioBuffer};
 
 use fft::{
-    do_fft, load_file, random_project, RandomVector, Time, DURATION, FFT_LEN, PENALTY_FRAME,
-    QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
+    do_fft, generate_varying_sine, load_file, random_project, FftSample, RandomVector, Time,
+    DURATION, FFT_LEN, PENALTY_FRAME, QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
 };
 
 /// How many previous frames of projections to look at when calculating sum
@@ -31,65 +32,88 @@ const ERROR_FRAME_HISTORY_COUNT: u64 = 16;
 const NEIGHBOR_COUNT: usize = 5;
 
 /// Injected latency in seconds.
-const ARTIFICAL_LATENCY: f64 = 50.0 / 1000.0;
+// const ARTIFICAL_LATENCY: f64 = 4.0;
+const ARTIFICAL_LATENCY: f64 = 0.1;
+
+/// Simple reduction of "pop" sound in the playback
+/// If a predicted time is within this many frames, just don't switch.
+const IGNORE_FRAME_COUNT: usize = 5;
+/// Minimum time to wait between jumping between times. (1 / maximum number of "pops" per second)
+const MINIMUM_SWITCH_INTERVAL: f64 = 0.2;
 
 fn main() {
-    let output_dir = std::env::args()
+    let mut args = std::env::args();
+    let output_dir = args
         .nth(1)
         .expect("pass the output directory path as an argument");
+    let source_file = args
+        .next()
+        .expect("pass the audio source file as the second argument");
     fs::create_dir(&output_dir).expect("could not create output directory");
 
     let context = AudioContext::default();
 
-    // Take source from microphone.
-    // use web_audio_api::media_devices;
-    // use web_audio_api::media_devices::MediaStreamConstraints;
-    // let mic = media_devices::get_user_media_sync(MediaStreamConstraints::Audio);
-    // // register as media element in the audio context
-    // let src = context.create_media_stream_source(&mic);
-
-    // play a buffer in a loop
-    let mut src = context.create_buffer_source();
-    src.set_buffer(
-        // load a file
-        load_file(
-            &context,
-            DURATION,
-            // "/Users/francischua/Downloads/sample2.ogg".to_owned(),
-            // "/Users/francischua/Downloads/ladispute_amp.ogg".to_owned(),
-            // "/Users/francischua/Downloads/turkishmarch.ogg".to_owned(),
-            "/Users/francischua/Downloads/stravinsky_cut.ogg".to_owned(),
-        ),
-        // or generate a sample (escalating chord stack)
-        // generate_varying_sine(&context, DURATION),
-    );
-    src.set_loop(true);
-    src.start();
+    let src: Box<dyn AudioNode> = if source_file == "microphone" {
+        // Take source from microphone.
+        let mic = media_devices::get_user_media_sync(MediaStreamConstraints::Audio);
+        // register as media element in the audio context
+        Box::new(context.create_media_stream_source(&mic))
+    } else if source_file == "wave" {
+        let mut src = context.create_buffer_source();
+        src.set_buffer(
+            // generate a sample (escalating chord stack)
+            generate_varying_sine(&context, DURATION),
+        );
+        src.set_loop(true);
+        src.start();
+        Box::new(src)
+    } else {
+        // play a buffer in a loop
+        let mut src = context.create_buffer_source();
+        src.set_buffer(
+            // load a file
+            load_file(
+                &context,
+                DURATION,
+                // "/Users/francischua/Downloads/sample2.ogg".to_owned(),
+                // "/Users/francischua/Downloads/ladispute_amp.ogg".to_owned(),
+                // "/Users/francischua/Downloads/turkishmarch.ogg".to_owned(),
+                // "/Users/francischua/Downloads/stravinsky_cut.ogg".to_owned(),
+                source_file,
+            ),
+        );
+        src.set_loop(true);
+        src.start();
+        Box::new(src)
+    };
 
     let fft = FftNode::new(&context, FftOptions { fft_len: FFT_LEN });
     let (fft, prediction_rx) = fft.consume_receiver();
-    src.connect(&fft);
 
     let left_panner = context.create_stereo_panner();
     left_panner.connect(&context.destination());
     left_panner.pan().set_value(1.);
 
-    let delay = context.create_delay(ARTIFICAL_LATENCY);
-    src.connect(&delay);
+    let delayed_input = context.create_delay(ARTIFICAL_LATENCY);
+    src.connect(&delayed_input);
+    delayed_input.connect(&fft);
 
     let context = Arc::new(context);
     let playback = PlaybackNode::new(context.clone(), PlaybackOptions { prediction_rx });
-    delay.connect(&playback);
+    delayed_input.connect(&playback);
 
     let right_panner = context.create_stereo_panner();
     right_panner.connect(&context.destination());
     right_panner.pan().set_value(-1.);
     src.connect(&right_panner);
     playback.connect(&left_panner);
+    // use this line instead of the above two when playing live
+    // playback.connect(&context.destination());
 
     let output = context.create_media_stream_destination();
     let recorder = MediaRecorder::new(output.stream());
-    context.destination().connect(&output);
+    right_panner.connect(&output);
+    left_panner.connect(&output);
     let recording = Box::<Arc<_>>::leak(Box::new(Arc::new(Mutex::new(Vec::new()))));
     recorder.set_ondataavailable(|mut event| {
         recording.lock().unwrap().append(&mut event.blob);
@@ -111,12 +135,21 @@ fn main() {
         DURATION * REPEATS as f32,
     ));
 
+    println!("Done running, writing data out.");
+
     recorder.stop();
 
     let times = fft.times.lock().unwrap().to_vec();
     serde_json::to_writer(
         &File::create(PathBuf::new().join(&output_dir).join("data.json")).unwrap(),
         &times,
+    )
+    .unwrap();
+
+    let fft_samples = fft.samples.lock().unwrap().to_vec();
+    serde_json::to_writer(
+        &File::create(PathBuf::new().join(&output_dir).join("fft_samples.json")).unwrap(),
+        &fft_samples,
     )
     .unwrap();
 
@@ -127,6 +160,7 @@ struct FftNode<PredictionType> {
     registration: AudioContextRegistration,
     channel_config: ChannelConfig,
     times: Arc<Mutex<Vec<Time>>>,
+    samples: Arc<Mutex<Vec<FftSample>>>,
     prediction: PredictionType,
 }
 
@@ -139,6 +173,7 @@ impl FftNode<Receiver<Prediction>> {
         context.register(move |registration| {
             let real_planner: RealFftPlanner<f32> = RealFftPlanner::<f32>::new();
             let times = Arc::new(Mutex::new(vec![]));
+            let samples = Arc::new(Mutex::new(vec![]));
             // Deterministic for reproducibility.
             let mut rng = rand::rngs::SmallRng::seed_from_u64(0xDEADBEEF);
             let mut gen_random_vector = || {
@@ -174,6 +209,7 @@ impl FftNode<Receiver<Prediction>> {
                     frames: vec![],
                 },
                 times: times.clone(),
+                samples: samples.clone(),
                 last_prediction: (0, tx),
                 prediction_manager: PredictionManager { data: vec![] },
             };
@@ -181,6 +217,7 @@ impl FftNode<Receiver<Prediction>> {
                 registration,
                 channel_config: ChannelConfig::default(),
                 times,
+                samples,
                 prediction: rx,
             };
 
@@ -195,6 +232,7 @@ impl FftNode<Receiver<Prediction>> {
                 registration: self.registration,
                 channel_config: self.channel_config,
                 times: self.times,
+                samples: self.samples,
                 prediction: (),
             },
             rx,
@@ -228,6 +266,7 @@ struct FftRenderer {
     random_vector: Vec<RandomVector>,
     frame_data: FrameData,
     times: Arc<Mutex<Vec<Time>>>,
+    samples: Arc<Mutex<Vec<FftSample>>>,
     last_prediction: (u64, Sender<Prediction>),
     prediction_manager: PredictionManager,
 }
@@ -265,6 +304,25 @@ impl AudioProcessor for FftRenderer {
             self.past_input.clone().make_contiguous(),
             &mut self.data,
         );
+        // Send some fft samples every so often.
+        {
+            let mut samples = self.samples.lock().unwrap();
+            if !samples
+                .last()
+                // Every 0.05 seconds.
+                .is_some_and(|s| scope.current_time - s.real < 0.05)
+            {
+                samples.push(FftSample {
+                    real: scope.current_time,
+                    magnitudes: self
+                        .data
+                        .iter()
+                        .map(|c| c.norm())
+                        .collect::<Vec<_>>()
+                        .clone(),
+                })
+            }
+        }
 
         let current_projections: Vec<_> = self
             .random_vector
@@ -413,7 +471,14 @@ fn calculate_error(
     //     error /= BONUS
     // }
 
+    // Add a temporary hack error
+    // TODO: remove / replace with something nicer
     (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
+        + if (current_frame).abs_diff(neighbor_frame) < 100_000 {
+            0.04
+        } else {
+            0.0
+        }
 }
 
 struct PlaybackNode {
@@ -478,6 +543,8 @@ struct ResizingBuffer {
     used: usize,
     start_time: f64,
     playback_index: usize,
+    /// Hard ceiling on how often we can switch.
+    last_switch_time: f64,
 }
 
 /// Avoid skipping back and forth rapidly.
@@ -557,6 +624,7 @@ impl ResizingBuffer {
             used: 0,
             start_time: context.current_time(),
             playback_index: 0,
+            last_switch_time: 0.0,
         }
     }
 
@@ -575,12 +643,19 @@ impl ResizingBuffer {
     }
 
     /// Sets the new time if it is far away.
-    fn try_set_time(&mut self, time: f64, sample_len: usize) -> bool {
+    fn try_set_time(&mut self, time: f64, sample_len: usize, current_time: f64) -> bool {
         let sample_duration = sample_len as f64 / self.buffer.sample_rate() as f64;
-        let time_tolerance = 100. * sample_duration;
-        let new_time = if (self.get_time() - time).abs() < time_tolerance {
+        // This prevents small amounts of noise causing lots of static.
+        // However, it also means that if the prediction is being incrementally
+        // corrected (perhaps due to changes in tempo), then there would be
+        // additional latency until `try_set_time` reflects that correction.
+        let time_tolerance = IGNORE_FRAME_COUNT as f64 * sample_duration;
+        let new_time = if (self.get_time() - time).abs() < time_tolerance
+            || (current_time - self.last_switch_time).abs() < MINIMUM_SWITCH_INTERVAL
+        {
             return false;
         } else {
+            self.last_switch_time = current_time;
             time
         };
 
@@ -598,10 +673,36 @@ impl ResizingBuffer {
         let output = output.channel_data_mut(0);
         let written_count = output
             .iter_mut()
-            .zip(self.buffer.get_channel_data(0)[self.playback_index..].iter())
+            .zip(
+                // self.buffer.get_channel_data(0)[self.playback_index..].iter(),
+                // Avoid panic when not enough data exists by using iterator methods.
+                self.buffer
+                    .get_channel_data(0)
+                    .iter()
+                    .skip(self.playback_index.saturating_sub(1)),
+            )
             .map(|(o, b)| *o = *b)
             .count();
         self.playback_index += written_count;
+        // If the written_count is 0, then the predicted time is in front of the data we have. So, play the most recent data we have
+        //
+        // note: this sounds pretty bad when the latency is in the seconds because the good predictions (perhaps repeats within a piece)
+        // will interleave with audio from seconds ago. should be okay with latency in the milliseconds though.
+        if written_count == 0 {
+            let count = output.len();
+            output
+                .iter_mut()
+                .zip(
+                    self.buffer
+                        .get_channel_data(0)
+                        .iter()
+                        .take(self.used)
+                        .rev()
+                        .take(count)
+                        .rev(),
+                )
+                .for_each(|(o, b)| *o = *b);
+        }
     }
 }
 
@@ -617,11 +718,15 @@ impl AudioProcessor for PlaybackRenderer {
         if let Ok(new_prediction) = self.prediction.try_recv() {
             // Account for possible elapsed time between sending and receiving.
             let updated_time = (scope.current_time - new_prediction.time_of_prediction)
-                + new_prediction.predicted_time
-                + ARTIFICAL_LATENCY;
+                + new_prediction.predicted_time;
+            // TODO check logic of latency
+            // + ARTIFICAL_LATENCY;
 
-            self.past_data
-                .try_set_time(updated_time, inputs[0].channel_data(0).len());
+            self.past_data.try_set_time(
+                updated_time,
+                inputs[0].channel_data(0).len(),
+                scope.current_time,
+            );
         }
         // // Only play if much in the past.
         // if scope.current_time - self.past_data.get_time() > DURATION as f64 {

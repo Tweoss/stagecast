@@ -3,8 +3,10 @@ use realfft::RealFftPlanner;
 use web_audio_api::context::BaseAudioContext;
 use web_audio_api::AudioBuffer;
 
+/// Samples per second
+pub const ASSUMED_SAMPLE_RATE: u64 = 44100;
 pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
-// pub const DURATION: f32 = 10.;
+// pub const DURATION: f32 = 5.;
 // Turkish March
 // pub const DURATION: f32 = 2. * 60. + 40.;
 // La Dispute
@@ -17,14 +19,11 @@ pub const REPEATS: usize = 1;
 pub const FFT_LEN: usize = 2usize.pow(15);
 /// How close a frame should be to apply a penalty.
 // pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
-pub const PENALTY_FRAME: u64 = 44100 * 8;
+pub const PENALTY_FRAME: u64 = ASSUMED_SAMPLE_RATE * 20 / 100;
+// pub const PENALTY_FRAME: u64 = 44100 * 8;
 pub const PENALTY: f64 = 10.0;
 /// Assumed render quantum size
 pub const QUANTUM_SIZE: u64 = 128;
-/// How close a new predicted frame must be to the last predicted time to get a bonus.
-pub const BONUS_FRAME: u64 = QUANTUM_SIZE * 10;
-/// The ratio of artificial decrease in error.
-pub const BONUS: f64 = 2.0;
 
 /// How many samples from the start and ends of the fft input
 /// to smooth down. Reduces noise in fft output.
@@ -37,6 +36,12 @@ pub struct Time {
     pub projection: Vec<f64>,
     pub error: f64,
     pub managed_prediction: f64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct FftSample {
+    pub real: f64,
+    pub magnitudes: Vec<f32>,
 }
 
 pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut [Complex<f32>]) {
