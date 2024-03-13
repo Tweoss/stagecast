@@ -41,6 +41,9 @@ const IGNORE_FRAME_COUNT: usize = 5;
 /// Minimum time to wait between jumping between times. (1 / maximum number of "pops" per second)
 const MINIMUM_SWITCH_INTERVAL: f64 = 0.2;
 
+/// How much importance falls off from recent samples to less recent samples.
+const WEIGHT_FALLOFF: f64 = 0.8;
+
 fn main() {
     let mut args = std::env::args();
     let output_dir = args
@@ -424,22 +427,31 @@ fn calculate_error(
         .iter()
         .rev()
         .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+        .flat_map(|n_i| projections.get(n_i).unwrap().1.iter())
+        // If there are not enough frames, don't just give back 0 error.
+        // Instead, fill with 0's so that error can still be calculated against
+        // the current_index's past.
+        .chain(std::iter::repeat(&0.0))
         .zip(
             frames[..=current_index]
                 .iter()
                 .rev()
-                .step_by(FFT_LEN / QUANTUM_SIZE as usize),
+                .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+                .flat_map(|c_i| projections.get(c_i).unwrap().1.iter())
+                .chain(std::iter::repeat(&0.0)),
         )
-        .take(ERROR_FRAME_HISTORY_COUNT as usize)
-        .flat_map(|(n_i, c_i)| {
-            projections
-                .get(n_i)
-                .unwrap()
-                .1
-                .iter()
-                .zip(projections.get(c_i).unwrap().1.iter())
-        })
-        .map(|(n, c)| (n - c).powi(2));
+        .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS)
+        .enumerate()
+        .map(|(i, (n, c))| {
+            // Weight exponentially per frame.
+            // We want constant * (falloff^0 + falloff^1 + ... + falloff^total_frame_count) = 1.
+            // We have 1 / c = falloff^0 + ... + falloff^total_frame_count = (falloff^(total_frame_count + 1) - 1) / (falloff - 1)
+            let frame_index = i / SEARCH_DIMENSIONS;
+            let constant = (WEIGHT_FALLOFF - 1.0)
+                / (WEIGHT_FALLOFF.powi(ERROR_FRAME_HISTORY_COUNT as i32 + 1) - 1.0);
+            let weight = constant * WEIGHT_FALLOFF.powi(frame_index as i32);
+            weight * (n - c).powi(2)
+        });
 
     assert_ne!(
         it.clone().count(),
