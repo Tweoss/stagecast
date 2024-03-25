@@ -5,18 +5,19 @@ use web_audio_api::AudioBuffer;
 
 /// Samples per second
 pub const ASSUMED_SAMPLE_RATE: u64 = 44100;
-pub const SEARCH_DIMENSIONS: usize = 2usize.pow(4);
 // pub const DURATION: f32 = 5.;
 // Turkish March
 // pub const DURATION: f32 = 2. * 60. + 40.;
 // La Dispute
-// pub const DURATION: f32 = 13. * 60.;
+pub const DURATION: f32 = 13. * 60. + 40.0;
 // Stravinsky
-pub const DURATION: f32 = 2. * 60. + 15.;
+// pub const DURATION: f32 = 2. * 60. + 15.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
 pub const FFT_LEN: usize = 2usize.pow(15);
+pub const PROJECTION_LENGTH: usize = 400;
+pub const SEARCH_DIMENSIONS: usize = 16;
 /// How close a frame should be to apply a penalty.
 // pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
 pub const PENALTY_FRAME: u64 = ASSUMED_SAMPLE_RATE * 20 / 100;
@@ -69,19 +70,38 @@ pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut
     output.iter_mut().for_each(|o| *o /= (length as f32).sqrt());
 }
 
-pub struct RandomVector {
+pub struct RandomSubspace<const CHUNK_SIZE: usize> {
     pub points: Vec<f32>,
 }
 
-pub fn random_project(input: &[Complex<f32>], projection: &RandomVector) -> f32 {
-    assert!(input.len() == projection.points.len());
-    input
-        .iter()
-        // atan is a very expensive operation so we just use magnitude not phase shift
-        .map(|v| v.norm_sqr().sqrt())
-        .zip(projection.points.iter())
-        .map(|(a, b)| a * b)
-        .sum::<f32>()
+// 2^15 = 32768
+// 44100 / 2^15 = 1.3458252
+// 44100/(440*32) = 3.13210227
+// 44100/(440)*4 = 400.90909091
+impl<const CHUNK_SIZE: usize> RandomSubspace<CHUNK_SIZE> {
+    pub fn random_project(&self, input: &[Complex<f32>]) -> Vec<f64> {
+        assert!(input.len() == self.points.len());
+        assert!(input.len() >= CHUNK_SIZE);
+        // input
+        //     .iter()
+        //     .map(|v| v.norm_sqr().sqrt())
+        //     .zip(projection.points.iter())
+        //     .map(|(a, b)| a * b)
+        //     .sum::<f32>()
+
+        self.points
+            .chunks(CHUNK_SIZE)
+            .zip(std::iter::repeat(&input[0..CHUNK_SIZE]))
+            .take(SEARCH_DIMENSIONS)
+            .map(|(v, p)| {
+                // atan is a very expensive operation so we just use magnitude not phase shift
+                v.iter()
+                    .zip(p.iter())
+                    .map(|(r, c)| (c.norm_sqr().sqrt() * r) as f64)
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>()
+    }
 }
 
 pub fn generate_varying_sine(context: &impl BaseAudioContext, duration: f32) -> AudioBuffer {

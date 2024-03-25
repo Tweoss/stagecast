@@ -3,8 +3,8 @@ use std::{
     path::PathBuf,
 };
 
-use egui::{Color32, Key, ViewportBuilder};
-use egui_plot::{HLine, Line, Plot, Points, VLine};
+use egui::{Color32, DragValue, Key, ViewportBuilder};
+use egui_plot::{HLine, Line, MarkerShape, Plot, Points, VLine};
 use fft::{FftSample, Time, ASSUMED_SAMPLE_RATE};
 use ordered_float::NotNan;
 use web_audio_api::{
@@ -14,9 +14,14 @@ use web_audio_api::{
 };
 
 fn main() {
-    let input_directory = std::env::args()
+    let mut args = std::env::args();
+    let input_directory = args
         .nth(1)
         .expect("pass the input directory path as an argument");
+    let error_scale = args
+        .next()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(1.0);
     let data = fs::read_to_string(PathBuf::new().join(&input_directory).join("data.json")).unwrap();
     let data: Vec<Time> = serde_json::de::from_str(&data).unwrap();
     let fft_samples = fs::read_to_string(
@@ -43,7 +48,7 @@ fn main() {
     eframe::run_native(
         &format!("Replay {}", &input_directory),
         native_options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             Box::new(ViewingApp::new(
                 cc,
                 data,
@@ -51,6 +56,7 @@ fn main() {
                 context,
                 buffer,
                 input_directory,
+                error_scale,
             ))
         }),
     )
@@ -66,6 +72,7 @@ struct ViewingApp {
     show_settings: ShowSettings,
     context: AudioContext,
     audio: Audio,
+    selected_index: usize,
     directory_name: String,
 }
 
@@ -184,6 +191,7 @@ impl ViewingApp {
         context: AudioContext,
         combination_buffer: AudioBuffer,
         directory_name: String,
+        error_scale: f64,
     ) -> Self {
         // This is also where you can customize the look and feel of egui using
         // `cc.egui_ctx.set_visuals` and `cc.egui_ctx.set_fonts`.
@@ -204,7 +212,7 @@ impl ViewingApp {
             projection: (0..data[0].projection.len())
                 .map(|i| select(real_iter.clone(), |t| t.projection[i], &data))
                 .collect(),
-            error: select(real_iter.clone(), |t| t.error, &data),
+            error: select(real_iter.clone(), |t| error_scale * t.error, &data),
             managed_prediction: select(real_iter.clone(), |t| t.managed_prediction, &data),
             fft_samples: fft_samples
                 .iter()
@@ -228,6 +236,7 @@ impl ViewingApp {
             show_settings: ShowSettings::default(),
             audio: Audio::new(&context, combination_buffer),
             context,
+            selected_index: 0,
             directory_name,
         }
     }
@@ -256,6 +265,10 @@ impl eframe::App for ViewingApp {
             ui.color_edit_button_srgba(&mut self.show_settings.error.0);
             ui.checkbox(&mut self.show_settings.real_sound, "Play Real");
             ui.checkbox(&mut self.show_settings.predicted_sound, "Play Predicted");
+            ui.add(
+                DragValue::new(&mut self.selected_index)
+                    .clamp_range(0..=(self.predicted.len() - 1)),
+            );
         });
 
         // egui::CentralPanel::default().show(ctx, |ui| {
@@ -273,7 +286,7 @@ impl eframe::App for ViewingApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("FFT Samples");
-            plot_fft(ui, self, current_position);
+            // plot_fft(ui, self, current_position);
         });
         // });
     }
@@ -287,6 +300,17 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
         .x_axis_label("real time")
         .y_axis_label("predicted time")
         .show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new(vec![
+                    [0.0, 0.0],
+                    [
+                        app.predicted.last().unwrap()[0],
+                        app.predicted.last().unwrap()[0],
+                    ],
+                ])
+                .color(Color32::YELLOW),
+            );
+
             if app.show_settings.predicted.1 {
                 plot_ui.points(
                     Points::new(app.predicted.clone()).color(app.show_settings.predicted.0),
@@ -300,6 +324,24 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
                     Points::new(app.managed_prediction.clone()).color(app.show_settings.managed.0),
                 );
             }
+            plot_ui.points(
+                Points::new(vec![app.predicted[app.selected_index]])
+                    .shape(MarkerShape::Diamond)
+                    .radius(10.0)
+                    .color(app.show_settings.predicted.0.to_opaque()),
+            );
+            plot_ui.points(
+                Points::new(vec![app.error[app.selected_index]])
+                    .shape(MarkerShape::Circle)
+                    .radius(10.0)
+                    .color(app.show_settings.error.0.to_opaque()),
+            );
+            plot_ui.points(
+                Points::new(vec![app.managed_prediction[app.selected_index]])
+                    .shape(MarkerShape::Circle)
+                    .radius(10.0)
+                    .color(app.show_settings.managed.0.to_opaque()),
+            );
             if let Some(playback_position) = &app.audio.get_position() {
                 ctx.request_repaint();
                 plot_ui.hline(HLine::new(*playback_position));
@@ -333,23 +375,23 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
     }
 }
 
-fn plot_fft(ui: &mut egui::Ui, app: &mut ViewingApp, current_position: f64) {
-    Plot::new("fft_plot")
-        .x_axis_label("Frequency (Hz)")
-        .y_axis_label("Amplitude")
-        .include_x(880.0)
-        .include_y(10.0)
-        .data_aspect(30.0 / 20.0)
-        .show(ui, |plot_ui| {
-            let closest_index = app
-                .fft_samples
-                .binary_search_by_key(&NotNan::new(current_position).unwrap(), |s| {
-                    NotNan::new(s.0).unwrap()
-                });
-            let closest_index = match closest_index {
-                Ok(i) => i,
-                Err(i) => i,
-            };
-            plot_ui.line(Line::new(app.fft_samples[closest_index].1.clone()));
-        });
-}
+// fn plot_fft(ui: &mut egui::Ui, app: &mut ViewingApp, current_position: f64) {
+//     Plot::new("fft_plot")
+//         .x_axis_label("Frequency (Hz)")
+//         .y_axis_label("Amplitude")
+//         .include_x(880.0)
+//         .include_y(10.0)
+//         .data_aspect(30.0 / 20.0)
+//         .show(ui, |plot_ui| {
+//             let closest_index = app
+//                 .fft_samples
+//                 .binary_search_by_key(&NotNan::new(current_position).unwrap(), |s| {
+//                     NotNan::new(s.0).unwrap()
+//                 });
+//             let closest_index = match closest_index {
+//                 Ok(i) => i,
+//                 Err(i) => i,
+//             };
+//             plot_ui.line(Line::new(app.fft_samples[closest_index].1.clone()));
+//         });
+// }

@@ -21,8 +21,8 @@ use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
 use web_audio_api::{media_devices, AudioBuffer};
 
 use fft::{
-    do_fft, generate_varying_sine, load_file, random_project, FftSample, RandomVector, Time,
-    DURATION, FFT_LEN, PENALTY_FRAME, QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
+    do_fft, generate_varying_sine, load_file, FftSample, RandomSubspace, Time, DURATION, FFT_LEN,
+    PENALTY_FRAME, PROJECTION_LENGTH, QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
 };
 
 /// How many previous frames of projections to look at when calculating sum
@@ -42,7 +42,7 @@ const IGNORE_FRAME_COUNT: usize = 5;
 const MINIMUM_SWITCH_INTERVAL: f64 = 0.2;
 
 /// How much importance falls off from recent samples to less recent samples.
-const WEIGHT_FALLOFF: f64 = 0.8;
+const WEIGHT_FALLOFF: f64 = 0.9;
 
 fn main() {
     let mut args = std::env::args();
@@ -141,6 +141,8 @@ fn main() {
     println!("Done running, writing data out.");
 
     recorder.stop();
+    delayed_input.disconnect_from(&playback);
+    // TODO disconnect src from output.
 
     let times = fft.times.lock().unwrap().to_vec();
     serde_json::to_writer(
@@ -179,7 +181,7 @@ impl FftNode<Receiver<Prediction>> {
             let samples = Arc::new(Mutex::new(vec![]));
             // Deterministic for reproducibility.
             let mut rng = rand::rngs::SmallRng::seed_from_u64(0xDEADBEEF);
-            let mut gen_random_vector = || {
+            let mut gen_random_subspace = || {
                 let mut vec = (0..(options.fft_len / 2 + 1))
                     .map(|_| rng.gen_range(-1.0_f32..1.0))
                     .collect::<Vec<_>>();
@@ -189,7 +191,7 @@ impl FftNode<Receiver<Prediction>> {
                     *el /= magnitude;
                 }
 
-                RandomVector { points: vec }
+                RandomSubspace { points: vec }
             };
             // Set exact size of backing buffer.
             let mut past_input: VecDeque<_> = vec![].into();
@@ -203,18 +205,19 @@ impl FftNode<Receiver<Prediction>> {
                 planner: real_planner,
                 past_input,
                 data: vec![Complex::new(0.0, 0.0); options.fft_len / 2 + 1],
-                random_vector: (0..SEARCH_DIMENSIONS)
-                    .map(|_| gen_random_vector())
-                    .collect(),
+                random_subspace: gen_random_subspace(),
                 frame_data: FrameData {
-                    btree: (0..SEARCH_DIMENSIONS).map(|_| BTreeMap::new()).collect(),
+                    btree: (0..FFT_LEN / 400).map(|_| BTreeMap::new()).collect(),
                     projections: HashMap::new(),
                     frames: vec![],
                 },
                 times: times.clone(),
                 samples: samples.clone(),
                 last_prediction: (0, tx),
-                prediction_manager: PredictionManager { data: vec![] },
+                prediction_manager: PredictionManager {
+                    data: vec![],
+                    last_prediction: None,
+                },
             };
             let node = FftNode {
                 registration,
@@ -266,7 +269,7 @@ struct FftRenderer {
     past_input: VecDeque<f32>,
     data: Vec<Complex<f32>>,
     planner: RealFftPlanner<f32>,
-    random_vector: Vec<RandomVector>,
+    random_subspace: RandomSubspace<PROJECTION_LENGTH>,
     frame_data: FrameData,
     times: Arc<Mutex<Vec<Time>>>,
     samples: Arc<Mutex<Vec<FftSample>>>,
@@ -309,29 +312,22 @@ impl AudioProcessor for FftRenderer {
         );
         // Send some fft samples every so often.
         {
-            let mut samples = self.samples.lock().unwrap();
-            if !samples
-                .last()
-                // Every 0.05 seconds.
-                .is_some_and(|s| scope.current_time - s.real < 0.05)
-            {
-                samples.push(FftSample {
-                    real: scope.current_time,
-                    magnitudes: self
-                        .data
-                        .iter()
-                        .map(|c| c.norm())
-                        .collect::<Vec<_>>()
-                        .clone(),
-                })
-            }
+            // let mut samples = self.samples.lock().unwrap();
+            // // Every .1 seconds
+            // if (scope.current_time * 100.0).rem_euclid(100.0) < 1.0 {
+            //     samples.push(FftSample {
+            //         real: scope.current_time,
+            //         magnitudes: self
+            //             .data
+            //             .iter()
+            //             .map(|c| c.norm())
+            //             .collect::<Vec<_>>()
+            //             .clone(),
+            //     })
+            // }
         }
 
-        let current_projections: Vec<_> = self
-            .random_vector
-            .iter()
-            .map(|v| random_project(&self.data, v) as f64)
-            .collect();
+        let current_projections: Vec<_> = self.random_subspace.random_project(&self.data);
         let current_frame_index = {
             self.frame_data.frames.push(scope.current_frame);
             self.frame_data.frames.len() - 1
@@ -368,7 +364,7 @@ impl AudioProcessor for FftRenderer {
             .map(|n_frame| -> (NotNan<f64>, u64) {
                 // Using sum squared error over all projections.
                 (
-                    NotNan::new(calculate_error(
+                    NotNan::new(calculate_dot_error(
                         &self.frame_data.projections,
                         &self.frame_data.frames,
                         n_frame,
@@ -381,22 +377,24 @@ impl AudioProcessor for FftRenderer {
             })
             .min_by_key(|(error, _)| *error)
         {
-            let predicted_time = best_frame as f64 / self.sample_rate;
-            self.prediction_manager
-                .add_prediction(predicted_time, scope.current_time);
-            let (frame, prediction) = self
-                .prediction_manager
-                .get_prediction(scope.current_time, self.sample_rate);
-            let _ = self.last_prediction.1.send(prediction.clone());
-            self.last_prediction.0 = frame;
+            if error.is_finite() {
+                let predicted_time = best_frame as f64 / self.sample_rate;
+                self.prediction_manager
+                    .add_prediction(predicted_time, scope.current_time);
+                let (frame, prediction) = self
+                    .prediction_manager
+                    .get_prediction(scope.current_time, self.sample_rate);
+                let _ = self.last_prediction.1.send(prediction.clone());
+                self.last_prediction.0 = frame;
 
-            self.times.lock().unwrap().push(Time {
-                real: scope.current_time,
-                predicted: predicted_time,
-                projection: current_projections.clone(),
-                error: *error,
-                managed_prediction: prediction.predicted_time,
-            });
+                self.times.lock().unwrap().push(Time {
+                    real: scope.current_time,
+                    predicted: predicted_time,
+                    projection: current_projections.clone(),
+                    error: *error,
+                    managed_prediction: prediction.predicted_time,
+                });
+            }
         }
 
         false
@@ -404,8 +402,14 @@ impl AudioProcessor for FftRenderer {
 }
 
 // TODO: perhaps weight more recent times more heavily
+// TODO: perhaps split into frequencies and only project relevant ones, ie 440*2^(-3, +3)
+// TODO: maybe have one long fft and one short fft. that way we match the rough place
+// and the precise place both. then both are somewhat irrespective of tempo, but having
+// the long one means we have more context, and the short one means we choose the best
+// place locally.
+// TODO: try using cosine similarity (dot product) instead
 // TODO: use r-trees?
-fn calculate_error(
+fn calculate_dot_error(
     projections: &HashMap<u64, (usize, Vec<f64>)>,
     frames: &[u64],
     neighbor_frame: u64,
@@ -422,42 +426,75 @@ fn calculate_error(
         .expect("should have neighbor's projection")
         .0;
 
-    // Take the frames such that their FFT's don't overlap
-    let it = frames[..=neighbor_index]
+    let current_it = frames[..=current_index]
         .iter()
         .rev()
         .step_by(FFT_LEN / QUANTUM_SIZE as usize)
-        .flat_map(|n_i| projections.get(n_i).unwrap().1.iter())
-        // If there are not enough frames, don't just give back 0 error.
-        // Instead, fill with 0's so that error can still be calculated against
-        // the current_index's past.
+        .flat_map(|c_i| projections.get(c_i).unwrap().1.iter())
         .chain(std::iter::repeat(&0.0))
-        .zip(
-            frames[..=current_index]
-                .iter()
-                .rev()
-                .step_by(FFT_LEN / QUANTUM_SIZE as usize)
-                .flat_map(|c_i| projections.get(c_i).unwrap().1.iter())
-                .chain(std::iter::repeat(&0.0)),
-        )
-        .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS)
-        .enumerate()
-        .map(|(i, (n, c))| {
-            // Weight exponentially per frame.
-            // We want constant * (falloff^0 + falloff^1 + ... + falloff^total_frame_count) = 1.
-            // We have 1 / c = falloff^0 + ... + falloff^total_frame_count = (falloff^(total_frame_count + 1) - 1) / (falloff - 1)
-            let frame_index = i / SEARCH_DIMENSIONS;
-            let constant = (WEIGHT_FALLOFF - 1.0)
-                / (WEIGHT_FALLOFF.powi(ERROR_FRAME_HISTORY_COUNT as i32 + 1) - 1.0);
-            let weight = constant * WEIGHT_FALLOFF.powi(frame_index as i32);
-            weight * (n - c).powi(2)
-        });
-
-    assert_ne!(
-        it.clone().count(),
-        0,
-        "Number of comparable frames should never be 0."
+        .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS);
+    // Take the frames such that their FFT's don't overlap
+    let dot_product = calculate_scaled_dot(
+        frames[..=neighbor_index]
+            .iter()
+            .rev()
+            .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+            .flat_map(|n_i| projections.get(n_i).unwrap().1.iter())
+            // If there are not enough frames, don't just give back 0 error.
+            // Instead, fill with 0's so that error can still be calculated against
+            // the current_index's past.
+            .chain(std::iter::repeat(&0.0))
+            .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS),
+        current_it.clone(),
     );
+    let self_dot_product = calculate_scaled_dot(current_it.clone(), current_it);
+    let normalized_dot_product = dot_product / self_dot_product;
+    let output = if normalized_dot_product <= 0.0 {
+        f64::INFINITY
+    } else {
+        normalized_dot_product.ln().abs()
+    };
+    if output.is_nan() {
+        f64::INFINITY
+    } else {
+        output
+    }
+
+    // let it = frames[..=neighbor_index]
+    //     .iter()
+    //     .rev()
+    //     .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+    //     .flat_map(|n_i| projections.get(n_i).unwrap().1.iter())
+    //     // If there are not enough frames, don't just give back 0 error.
+    //     // Instead, fill with 0's so that error can still be calculated against
+    //     // the current_index's past.
+    //     .chain(std::iter::repeat(&0.0))
+    //     .zip(
+    //         frames[..=current_index]
+    //             .iter()
+    //             .rev()
+    //             .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+    //             .flat_map(|c_i| projections.get(c_i).unwrap().1.iter())
+    //             .chain(std::iter::repeat(&0.0)),
+    //     )
+    //     .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS)
+    //     .enumerate()
+    //     .map(|(i, (n, c))| {
+    //         // Weight exponentially per frame.
+    //         // We want constant * (falloff^0 + falloff^1 + ... + falloff^total_frame_count) = 1.
+    //         // We have 1 / c = falloff^0 + ... + falloff^total_frame_count = (falloff^(total_frame_count + 1) - 1) / (falloff - 1)
+    //         let frame_index = i / SEARCH_DIMENSIONS;
+    //         let constant = (WEIGHT_FALLOFF - 1.0)
+    //             / (WEIGHT_FALLOFF.powi(ERROR_FRAME_HISTORY_COUNT as i32 + 1) - 1.0);
+    //         let weight = constant * WEIGHT_FALLOFF.powi(frame_index as i32);
+    //         weight * (n - c).powi(2)
+    //     });
+
+    // assert_ne!(
+    //     it.clone().count(),
+    //     0,
+    //     "Number of comparable frames should never be 0."
+    // );
 
     // let frame_delta = current_frame.abs_diff(neighbor_frame);
 
@@ -485,12 +522,31 @@ fn calculate_error(
 
     // Add a temporary hack error
     // TODO: remove / replace with something nicer
-    (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
-        + if (current_frame).abs_diff(neighbor_frame) < 100_000 {
-            0.04
-        } else {
-            0.0
-        }
+    // (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
+    //     + if (current_frame).abs_diff(neighbor_frame) < 100_000 {
+    //         0.04
+    //     } else {
+    //         0.0
+    //     }
+}
+
+fn calculate_scaled_dot<'a>(
+    it1: impl Iterator<Item = &'a f64>,
+    it2: impl Iterator<Item = &'a f64>,
+) -> f64 {
+    // Weight exponentially per frame.
+    // We want constant * (falloff^0 + falloff^1 + ... + falloff^total_frame_count) = 1.
+    // We have 1 / c = falloff^0 + ... + falloff^total_frame_count = (falloff^(total_frame_count + 1) - 1) / (falloff - 1)
+    let constant =
+        (WEIGHT_FALLOFF - 1.0) / (WEIGHT_FALLOFF.powi(ERROR_FRAME_HISTORY_COUNT as i32 + 1) - 1.0);
+    it1.zip(it2)
+        .enumerate()
+        .map(|(i, (a, b))| {
+            let frame_index = i / SEARCH_DIMENSIONS;
+            let weight = constant * WEIGHT_FALLOFF.powi(frame_index as i32);
+            a * b * weight
+        })
+        .sum()
 }
 
 struct PlaybackNode {
@@ -562,25 +618,29 @@ struct ResizingBuffer {
 /// Avoid skipping back and forth rapidly.
 struct PredictionManager {
     data: Vec<(f64, NotNan<f64>)>,
+    last_prediction: Option<usize>,
 }
 
 impl PredictionManager {
     /// The range in which two timestamps are considered close enough to be the same prediction.
     const EQUAL_WINDOW: f64 = 1.0;
+    // TODO: increase
     const DECAY_RATIO: f64 = 21.0 / 22.0;
     const INCREMENT: f64 = 1.0;
+    /// How much larger the count should be than the last prediction's count before switching.
+    const JUMP_DISTANCE: f64 = 0.0;
 
-    /// Returns a prediction and the closest frame that matches that prediction.
-    /// Assumes that frames are always divisible by QUANTUM_SIZE.
+    // TODO: make "sticky". add past best prediction, and only switch if
+    // new best is some amount better than past best.
+
     fn add_prediction(&mut self, predicted_time: f64, current_time: f64) {
         let normalized_time = predicted_time - current_time;
         let mut found_match = false;
         for (time, count) in &mut self.data {
             // 1 second window
             if (*time - normalized_time).abs() < Self::EQUAL_WINDOW {
-                // TODO: just rewrite?
-                // *time = **count;
                 // Recalculate the prediction, using the count as a weight.
+                // Using count as weight helps reduce noise from predictions.
                 *time = (*time * **count + normalized_time) / (**count + 1.0);
                 *count += Self::INCREMENT;
                 found_match = true;
@@ -593,14 +653,55 @@ impl PredictionManager {
             self.data.push((normalized_time, NotNan::new(1.0).unwrap()));
         }
 
-        let best_time = self.get_best_time(current_time);
-        // Remove everything (except the best time) with a counter value less than 1.
-        self.data
-            .retain(|(t, c)| **c >= 1.0 && t.partial_cmp(&best_time) != Some(Ordering::Equal));
+        let best_index = self.get_best_time_index();
+
+        let last_prediction_value = self.last_prediction.map(|i| self.data[i]);
+
+        // Remove everything (except the best time and last predicted time) with a counter value less than 1.
+        self.data = self
+            .data
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (t, c))| {
+                if self.last_prediction == Some(i) || **c >= 1.0 || i == best_index {
+                    Some((*t, *c))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // We must not have removed the last prediction, so find its new index.
+        self.last_prediction = if let Some(last_prediction_value) = last_prediction_value {
+            Some(
+                self.data
+                    .iter()
+                    .position(|v| *v == last_prediction_value)
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
     }
 
-    fn get_prediction(&self, current_time: f64, sample_rate: f64) -> (u64, Prediction) {
-        let best_time = self.get_best_time(current_time);
+    /// Returns a prediction and the closest frame that matches that prediction.
+    /// Assumes that frames are always divisible by QUANTUM_SIZE.
+    fn get_prediction(&mut self, current_time: f64, sample_rate: f64) -> (u64, Prediction) {
+        let index = self.get_best_time_index();
+
+        let index = if self.data[index].1
+            >= self
+                .last_prediction
+                .map(|i| self.data[i].1)
+                .unwrap_or(0.0.try_into().unwrap())
+                + Self::JUMP_DISTANCE
+        {
+            self.last_prediction = Some(index);
+            index
+        } else {
+            self.last_prediction.unwrap_or(0)
+        };
+        let best_time = self.data[index].0 + current_time;
 
         (
             Self::round_to_frame(best_time, sample_rate),
@@ -616,13 +717,15 @@ impl PredictionManager {
         (time * sample_rate / QUANTUM_SIZE as f64).round() as u64 * QUANTUM_SIZE
     }
 
-    fn get_best_time(&self, current_time: f64) -> f64 {
-        self.data
+    fn get_best_time_index(&self) -> usize {
+        let index = self
+            .data
             .iter()
-            .max_by_key(|d| d.1)
-            .map(|d| d.0)
-            .unwrap_or(0.0)
-            + current_time
+            .enumerate()
+            .max_by_key(|d| d.1 .1)
+            .map(|d| (d.0))
+            .expect("data should not be empty");
+        index
     }
 }
 
