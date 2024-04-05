@@ -3,7 +3,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::ops::Bound::Excluded;
 use std::ops::Bound::Unbounded;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
@@ -20,7 +20,7 @@ use web_audio_api::render::{AudioProcessor, AudioRenderQuantum};
 use web_audio_api::{media_devices, AudioBuffer};
 
 use fft::{
-    do_fft, generate_varying_sine, load_file, FftSample, RandomSubspace, Time, DURATION, FFT_LEN,
+    do_fft, generate_varying_sine, load_file, FftSample, RandomSubspace, Time, FFT_LEN,
     IGNORE_FRAME, PROJECTION_LENGTH, QUANTUM_SIZE, REPEATS, SEARCH_DIMENSIONS,
 };
 
@@ -53,36 +53,46 @@ fn main() {
     let source_file = args
         .next()
         .expect("pass the audio source file as the second argument");
-    fs::create_dir(&output_dir).expect("could not create output directory");
+    let duration = args
+        .next()
+        .map(|s| s.parse::<f32>().expect("Invalid f32 for duration"));
 
     let context = AudioContext::default();
 
     // TODO: take duration as arg
-    let src: Box<dyn AudioNode> = if source_file == "microphone" {
+    let (src, duration): (Box<dyn AudioNode>, _) = if source_file == "mic" {
         // Take source from microphone.
         let mic = media_devices::get_user_media_sync(MediaStreamConstraints::Audio);
+
         // register as media element in the audio context
-        Box::new(context.create_media_stream_source(&mic))
+        (
+            Box::new(context.create_media_stream_source(&mic)),
+            duration.expect("pass duration argument"),
+        )
     } else if source_file == "wave" {
         let mut src = context.create_buffer_source();
+        let duration = duration.expect("pass duration argument");
         src.set_buffer(
             // generate a sample (escalating chord stack)
-            generate_varying_sine(&context, DURATION),
+            generate_varying_sine(&context, duration),
         );
         src.set_loop(true);
         src.start();
-        Box::new(src)
+        (Box::new(src), duration)
     } else {
         // play a buffer in a loop
         let mut src = context.create_buffer_source();
+        let buffer = load_file(&context, source_file);
         src.set_buffer(
             // load a file
-            load_file(&context, DURATION, source_file),
+            buffer.clone(),
         );
         src.set_loop(true);
         src.start();
-        Box::new(src)
+        (Box::new(src), buffer.duration() as f32)
     };
+
+    fs::create_dir(&output_dir).expect("could not create output directory");
 
     let fft = FftNode::new(&context, FftOptions { fft_len: FFT_LEN });
     let (fft, prediction_rx) = fft.consume_receiver();
@@ -132,7 +142,7 @@ fn main() {
 
     // enjoy listening
     std::thread::sleep(std::time::Duration::from_secs_f32(
-        DURATION * REPEATS as f32,
+        duration * REPEATS as f32,
     ));
 
     println!("Done running, writing data out.");

@@ -15,7 +15,7 @@ pub const ASSUMED_SAMPLE_RATE: u64 = 44100;
 // Delecluese
 // pub const DURATION: f32 = 3. * 60. + 50.;
 // Schumann
-pub const DURATION: f32 = 2. * 60. + 40.;
+// pub const DURATION: f32 = 2. * 60. + 40.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
@@ -85,12 +85,6 @@ impl<const CHUNK_SIZE: usize> RandomSubspace<CHUNK_SIZE> {
     pub fn random_project(&self, input: &[Complex<f32>]) -> Vec<f64> {
         assert!(input.len() == self.points.len());
         assert!(input.len() >= CHUNK_SIZE);
-        // input
-        //     .iter()
-        //     .map(|v| v.norm_sqr().sqrt())
-        //     .zip(projection.points.iter())
-        //     .map(|(a, b)| a * b)
-        //     .sum::<f32>()
 
         self.points
             .chunks(CHUNK_SIZE)
@@ -133,15 +127,8 @@ pub fn generate_varying_sine(context: &impl BaseAudioContext, duration: f32) -> 
     buffer
 }
 
-pub fn load_file(context: &impl BaseAudioContext, duration: f32, path: String) -> AudioBuffer {
+pub fn load_file(context: &impl BaseAudioContext, path: String) -> AudioBuffer {
     // for background music, read from local file
     let file = std::fs::File::open(path).unwrap();
-    let buffer = context.decode_audio_data_sync(file).unwrap();
-    let mut output = context.create_buffer(
-        1,
-        (duration * context.sample_rate()) as usize,
-        context.sample_rate(),
-    );
-    output.copy_to_channel(buffer.get_channel_data(0), 0);
-    output
+    context.decode_audio_data_sync(file).unwrap()
 }
