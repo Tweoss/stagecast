@@ -9,19 +9,21 @@ pub const ASSUMED_SAMPLE_RATE: u64 = 44100;
 // Turkish March
 // pub const DURATION: f32 = 2. * 60. + 40.;
 // La Dispute
-pub const DURATION: f32 = 13. * 60. + 40.0;
+// pub const DURATION: f32 = 13. * 60. + 40.0;
 // Stravinsky
 // pub const DURATION: f32 = 2. * 60. + 15.;
+// Delecluese
+// pub const DURATION: f32 = 3. * 60. + 50.;
+// Schumann
+pub const DURATION: f32 = 2. * 60. + 40.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
 pub const FFT_LEN: usize = 2usize.pow(15);
 pub const PROJECTION_LENGTH: usize = 400;
 pub const SEARCH_DIMENSIONS: usize = 16;
-/// How close a frame should be to apply a penalty.
-// pub const PENALTY_FRAME: u64 = 44100 * 13 * 60 / 4;
-pub const PENALTY_FRAME: u64 = ASSUMED_SAMPLE_RATE * 20 / 100;
-// pub const PENALTY_FRAME: u64 = 44100 * 8;
+/// How close a frame should be to consider it as effectively current time.
+pub const IGNORE_FRAME: u64 = ASSUMED_SAMPLE_RATE;
 pub const PENALTY: f64 = 10.0;
 /// Assumed render quantum size
 pub const QUANTUM_SIZE: u64 = 128;
@@ -37,6 +39,7 @@ pub struct Time {
     pub projection: Vec<f64>,
     pub error: f64,
     pub managed_prediction: f64,
+    pub dot_error: f64,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
