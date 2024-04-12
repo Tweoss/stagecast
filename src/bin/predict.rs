@@ -82,7 +82,7 @@ fn main() {
     } else {
         // play a buffer in a loop
         let mut src = context.create_buffer_source();
-        let buffer = load_file(&context, source_file);
+        let buffer = load_file(&context, &source_file);
         src.set_buffer(
             // load a file
             buffer.clone(),
@@ -115,10 +115,12 @@ fn main() {
     let right_panner = context.create_stereo_panner();
     right_panner.connect(&context.destination());
     right_panner.pan().set_value(-1.);
-    src.connect(&right_panner);
-    playback.connect(&left_panner);
-    // use this line instead of the above two when playing live
-    // playback.connect(&context.destination());
+    if source_file == "mic" {
+        playback.connect(&context.destination());
+    } else {
+        src.connect(&right_panner);
+        playback.connect(&left_panner);
+    }
 
     let output = context.create_media_stream_destination();
     let recorder = MediaRecorder::new(output.stream());

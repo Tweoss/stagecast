@@ -5,17 +5,6 @@ use web_audio_api::AudioBuffer;
 
 /// Samples per second
 pub const ASSUMED_SAMPLE_RATE: u64 = 44100;
-// pub const DURATION: f32 = 5.;
-// Turkish March
-// pub const DURATION: f32 = 2. * 60. + 40.;
-// La Dispute
-// pub const DURATION: f32 = 13. * 60. + 40.0;
-// Stravinsky
-// pub const DURATION: f32 = 2. * 60. + 15.;
-// Delecluese
-// pub const DURATION: f32 = 3. * 60. + 50.;
-// Schumann
-// pub const DURATION: f32 = 2. * 60. + 40.;
 pub const REPEATS: usize = 1;
 // TODO check best value
 // 2^17 = 131072. 131072 / 44100 = 2.972154195
@@ -127,7 +116,7 @@ pub fn generate_varying_sine(context: &impl BaseAudioContext, duration: f32) -> 
     buffer
 }
 
-pub fn load_file(context: &impl BaseAudioContext, path: String) -> AudioBuffer {
+pub fn load_file(context: &impl BaseAudioContext, path: &str) -> AudioBuffer {
     // for background music, read from local file
     let file = std::fs::File::open(path).unwrap();
     context.decode_audio_data_sync(file).unwrap()
