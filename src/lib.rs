@@ -1,3 +1,6 @@
+pub mod search;
+
+use ordered_float::NotNan;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::BaseAudioContext;
@@ -25,7 +28,7 @@ const SMOOTHING_COUNT: usize = QUANTUM_SIZE as usize * 5;
 pub struct Time {
     pub real: f64,
     pub predicted: f64,
-    pub projection: Vec<f64>,
+    pub projection: Vec<NotNan<f32>>,
     pub error: f64,
     pub managed_prediction: f64,
     pub dot_error: f64,

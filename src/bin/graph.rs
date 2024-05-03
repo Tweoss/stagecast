@@ -3,10 +3,9 @@ use std::{
     path::PathBuf,
 };
 
-use egui::{Color32, DragValue, Key, ViewportBuilder};
+use egui::{emath::Numeric, Color32, DragValue, Key, ViewportBuilder};
 use egui_plot::{HLine, Line, MarkerShape, Plot, Points, VLine};
 use fft::{FftSample, Time, ASSUMED_SAMPLE_RATE};
-use ordered_float::NotNan;
 use web_audio_api::{
     context::{AudioContext, BaseAudioContext},
     node::{AudioBufferSourceNode, AudioNode, AudioScheduledSourceNode, StereoPannerNode},
@@ -22,15 +21,22 @@ fn main() {
         .next()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
-    let data = fs::read_to_string(PathBuf::new().join(&input_directory).join("data.json")).unwrap();
-    let data: Vec<Time> = serde_json::de::from_str(&data).unwrap();
-    let fft_samples = fs::read_to_string(
-        PathBuf::new()
-            .join(&input_directory)
-            .join("fft_samples.json"),
-    )
-    .unwrap();
-    let fft_samples: Vec<FftSample> = serde_json::de::from_str(&fft_samples).unwrap();
+    let data = match (
+        fs::read(PathBuf::new().join(&input_directory).join("data.cbor")),
+        fs::read_to_string(PathBuf::new().join(&input_directory).join("data.json")),
+    ) {
+        (Ok(f), _) => serde_cbor::from_slice::<Vec<Time>>(&f).unwrap(),
+        (_, Ok(f)) => serde_json::de::from_str(&f).unwrap(),
+        _ => panic!("Could not read data.cbor or data.json"),
+    };
+    // let fft_samples = fs::read_to_string(
+    //     PathBuf::new()
+    //         .join(&input_directory)
+    //         .join("fft_samples.json"),
+    // )
+    // .unwrap();
+    // let fft_samples: Vec<FftSample> = serde_json::de::from_str(&fft_samples).unwrap();
+    let fft_samples = vec![];
     // let data = data.iter().take(5_00).collect::<Vec<_>>();
 
     // Load recording.
@@ -68,6 +74,7 @@ struct ViewingApp {
     projection: Vec<Vec<[f64; 2]>>,
     error: Vec<[f64; 2]>,
     managed_prediction: Vec<[f64; 2]>,
+    dot_error: Vec<[f64; 2]>,
     fft_samples: Vec<(f64, Vec<[f64; 2]>)>,
     show_settings: ShowSettings,
     context: AudioContext,
@@ -89,7 +96,7 @@ impl Default for ShowSettings {
         ShowSettings {
             managed: (Color32::from_rgb(198, 88, 201).gamma_multiply(0.2), true),
             predicted: (Color32::GREEN.gamma_multiply(0.2), true),
-            error: (Color32::RED, false),
+            error: (Color32::RED.gamma_multiply(0.4), false),
             real_sound: true,
             predicted_sound: true,
         }
@@ -210,9 +217,10 @@ impl ViewingApp {
         ViewingApp {
             predicted: select(real_iter.clone(), |t| t.predicted, &data),
             projection: (0..data[0].projection.len())
-                .map(|i| select(real_iter.clone(), |t| t.projection[i], &data))
+                .map(|i| select(real_iter.clone(), |t| t.projection[i].to_f64(), &data))
                 .collect(),
             error: select(real_iter.clone(), |t| error_scale * t.error, &data),
+            dot_error: select(real_iter.clone(), |t| error_scale * t.dot_error, &data),
             managed_prediction: select(real_iter.clone(), |t| t.managed_prediction, &data),
             fft_samples: fft_samples
                 .iter()
@@ -279,6 +287,11 @@ impl eframe::App for ViewingApp {
                 ui.heading("Predictions");
 
                 ui.separator();
+                ui.add(egui::Slider::new(
+                    &mut self.selected_index,
+                    0..=(self.predicted.len() - 1),
+                ));
+                ui.separator();
 
                 plot_data(ctx, ui, self)
             })
@@ -299,6 +312,7 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
         .include_y(0.0)
         .x_axis_label("real time")
         .y_axis_label("predicted time")
+        .data_aspect(1.0)
         .show(ui, |plot_ui| {
             plot_ui.line(
                 Line::new(vec![
@@ -318,6 +332,7 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
             }
             if app.show_settings.error.1 {
                 plot_ui.points(Points::new(app.error.clone()).color(app.show_settings.error.0));
+                plot_ui.points(Points::new(app.dot_error.clone()).color(app.show_settings.error.0));
             }
             if app.show_settings.managed.1 {
                 plot_ui.points(
@@ -327,11 +342,17 @@ fn plot_data(ctx: &egui::Context, ui: &mut egui::Ui, app: &mut ViewingApp) -> f6
             plot_ui.points(
                 Points::new(vec![app.predicted[app.selected_index]])
                     .shape(MarkerShape::Diamond)
-                    .radius(10.0)
+                    .radius(15.0)
                     .color(app.show_settings.predicted.0.to_opaque()),
             );
             plot_ui.points(
                 Points::new(vec![app.error[app.selected_index]])
+                    .shape(MarkerShape::Circle)
+                    .radius(10.0)
+                    .color(app.show_settings.error.0.to_opaque()),
+            );
+            plot_ui.points(
+                Points::new(vec![app.dot_error[app.selected_index]])
                     .shape(MarkerShape::Circle)
                     .radius(10.0)
                     .color(app.show_settings.error.0.to_opaque()),

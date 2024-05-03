@@ -17,13 +17,16 @@ eframe = { version = "0.26.0", default-features = false, features = [
     "persistence",   # Enable restoring app state when restarting the app.
 ] }
 egui_plot = "0.26.0"
-ordered-float = { version = "4.0", default-features = false }
+ordered-float = { version = "4.0", default-features = false, features = [ "serde" ] }
 plotters = "0.3.3"
 rand = { version = "0.8.5", features = [ "small_rng" ] }
 realfft = "3.3.0"
 serde_json = "1.0"
 serde = { version = "1.0", features = [ "derive" ] }
 web-audio-api = "0.42.0"
+itertools = "0.12.1"
+rstar = "0.12.0"
+serde_cbor = "0.11.2"
 
 [profile.release]
 debug = true

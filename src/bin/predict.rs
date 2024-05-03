@@ -1,13 +1,13 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
-use std::ops::Bound::Excluded;
-use std::ops::Bound::Unbounded;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
+use fft::search::{ProjectionHistory, RTReeHistory};
 use ordered_float::NotNan;
+use plotters::coord::combinators::LogScalable;
 use rand::Rng;
 use rand::SeedableRng;
 use realfft::num_complex::Complex;
@@ -31,10 +31,10 @@ const ERROR_FRAME_HISTORY_COUNT: u64 = 16;
 const NEIGHBOR_COUNT: usize = 5;
 /// The maximum distance the dot product can be for a prediction to be
 /// considered good.
-const DOT_LIMIT: f64 = 4.0;
+const DOT_LIMIT: f64 = 3.0;
 
 /// Injected latency in seconds.
-const ARTIFICIAL_LATENCY: f64 = 0.1;
+const ARTIFICIAL_LATENCY: f64 = 0.2;
 
 /// Simple reduction of "pop" sound in the playback
 /// If a predicted time is within this many frames, just don't switch.
@@ -156,15 +156,15 @@ fn main() {
     playback.disconnect_from(&left_panner);
 
     let times = fft.times.lock().unwrap().to_vec();
-    serde_json::to_writer(
-        &File::create(PathBuf::new().join(&output_dir).join("data.json")).unwrap(),
+    serde_cbor::to_writer(
+        &File::create(PathBuf::new().join(&output_dir).join("data.cbor")).unwrap(),
         &times,
     )
     .unwrap();
 
     let fft_samples = fft.samples.lock().unwrap().to_vec();
-    serde_json::to_writer(
-        &File::create(PathBuf::new().join(&output_dir).join("fft_samples.json")).unwrap(),
+    serde_cbor::to_writer(
+        &File::create(PathBuf::new().join(&output_dir).join("fft_samples.cbor")).unwrap(),
         &fft_samples,
     )
     .unwrap();
@@ -216,7 +216,8 @@ impl FftNode<Receiver<Prediction>> {
                 data: vec![Complex::new(0.0, 0.0); options.fft_len / 2 + 1],
                 random_subspace: gen_random_subspace(),
                 frame_data: FrameData {
-                    btree: (0..FFT_LEN / 400).map(|_| BTreeMap::new()).collect(),
+                    history: RTReeHistory::default(),
+                    // history: BTreeHistory::new(FFT_LEN / 400),
                     projections: HashMap::new(),
                     frames: vec![],
                 },
@@ -288,9 +289,9 @@ struct FftRenderer {
 
 struct FrameData {
     /// Map from random projection to frame number
-    btree: Vec<BTreeMap<NotNan<f32>, u64>>,
+    history: RTReeHistory<{ SEARCH_DIMENSIONS }>,
     /// Map from timestamp to index in frame_history and projections.
-    projections: HashMap<u64, (usize, Vec<f64>)>,
+    projections: HashMap<u64, (usize, Vec<NotNan<f32>>)>,
     /// List of consecutive frame numbers
     frames: Vec<u64>,
 }
@@ -336,7 +337,12 @@ impl AudioProcessor for FftRenderer {
             // }
         }
 
-        let current_projections: Vec<_> = self.random_subspace.random_project(&self.data);
+        let current_projections: Vec<_> = self
+            .random_subspace
+            .random_project(&self.data)
+            .into_iter()
+            .map(|f| NotNan::new(f as f32).unwrap())
+            .collect();
         let current_frame_index = {
             self.frame_data.frames.push(scope.current_frame);
             self.frame_data.frames.len() - 1
@@ -347,26 +353,39 @@ impl AudioProcessor for FftRenderer {
             (current_frame_index, current_projections.clone()),
         );
 
+        // Use recent projections when looking up in history index.
+        let lookup_projections = self
+            .frame_data
+            .frames
+            .iter_mut()
+            .rev()
+            .step_by(FFT_LEN / QUANTUM_SIZE as usize)
+            .take(10)
+            .map(|i| &self.frame_data.projections[i].1)
+            .enumerate()
+            .fold(vec![NotNan::new(0.0).unwrap(); 16], |mut a, (i, v)| {
+                let constant = (WEIGHT_FALLOFF - 1.0)
+                    / (WEIGHT_FALLOFF.powi(ERROR_FRAME_HISTORY_COUNT as i32 + 1) - 1.0);
+                let weight = constant * WEIGHT_FALLOFF.powi(i as i32);
+                for (a, v) in a.iter_mut().zip(v.iter()) {
+                    *a += v * weight as f32;
+                }
+                a
+            });
+
+        self.frame_data
+            .history
+            .insert(&lookup_projections, scope.current_frame);
         // Find the best guess among neighbors.
-        // TODO: try R-tree
-        if let Some((error, best_frame)) = current_projections
-            .iter()
-            .zip(self.frame_data.btree.iter_mut())
-            .flat_map(|(p, b)| {
-                let projection = NotNan::new(*p as f32).unwrap();
-                b.insert(projection, scope.current_frame);
-                b.range(..projection)
-                    .filter(|(_, n_f)| (scope.current_frame - *n_f) > IGNORE_FRAME)
-                    .rev()
-                    .take(NEIGHBOR_COUNT)
-                    .chain(
-                        // Make sure not to include the *just* inserted projection.
-                        b.range((Excluded(projection), Unbounded))
-                            .filter(|(_, n_f)| (scope.current_frame - *n_f) > IGNORE_FRAME)
-                            .take(NEIGHBOR_COUNT),
-                    )
-                    .map(|(_, t)| *t)
-            })
+        if let Some((error, best_frame)) = self
+            .frame_data
+            .history
+            .search(
+                &lookup_projections,
+                NEIGHBOR_COUNT * 20,
+                scope.current_frame,
+                IGNORE_FRAME,
+            )
             // Include the last prediction (if it exists and is far enough away)
             .chain(
                 self.last_prediction
@@ -415,6 +434,7 @@ impl AudioProcessor for FftRenderer {
                     scope.current_frame,
                 ),
             );
+            // TODO normalize both, and also calculate error based off of magnitude ratio
             let predicted_time = if error.is_finite() && dot_error < DOT_LIMIT.ln() {
                 best_frame as f64 / self.sample_rate + ARTIFICIAL_LATENCY
             } else {
@@ -447,12 +467,12 @@ impl AudioProcessor for FftRenderer {
 // and the precise place both. then both are somewhat irrespective of tempo, but having
 // the long one means we have more context, and the short one means we choose the best
 // place locally.
-// TODO: use r-trees?
+// TODO: have random projections maybe two per musical note, and interpolate. might get better signal
 fn generate_iterator<'a>(
-    projections: &'a HashMap<u64, (usize, Vec<f64>)>,
+    projections: &'a HashMap<u64, (usize, Vec<NotNan<f32>>)>,
     frames: &'a [u64],
     frame: u64,
-) -> impl Iterator<Item = &'a f64> + Clone {
+) -> impl 'a + Iterator<Item = f64> + Clone {
     let index = projections
         .get(&frame)
         .expect("should have stored frame's projection")
@@ -463,17 +483,17 @@ fn generate_iterator<'a>(
         .rev()
         // Take the frames such that their FFT input windows don't overlap
         .step_by(FFT_LEN / QUANTUM_SIZE as usize)
-        .flat_map(|c_i| projections.get(c_i).unwrap().1.iter())
+        .flat_map(|c_i| projections.get(c_i).unwrap().1.iter().map(|f| f.as_f64()))
         // If there are not enough frames, don't just give back 0 error.
         // Instead, fill with 0's so that error can still be calculated against
         // the current_index's past.
-        .chain(std::iter::repeat(&0.0))
+        .chain(std::iter::repeat(0.0))
         .take(ERROR_FRAME_HISTORY_COUNT as usize * SEARCH_DIMENSIONS)
 }
 
-fn calculate_sse<'a>(
-    it1: impl Iterator<Item = &'a f64> + Clone,
-    it2: impl Iterator<Item = &'a f64> + Clone,
+fn calculate_sse(
+    it1: impl Iterator<Item = f64> + Clone,
+    it2: impl Iterator<Item = f64> + Clone,
 ) -> f64 {
     let it = it1.zip(it2).enumerate().map(|(i, (n, c))| {
         // Weight exponentially per frame.
@@ -489,12 +509,12 @@ fn calculate_sse<'a>(
     (it.clone().sum::<f64>() / (it.count() as f64)).sqrt()
 }
 
-fn calculate_scaled_dot<'a>(
-    it1: impl Iterator<Item = &'a f64> + Clone,
-    it2: impl Iterator<Item = &'a f64> + Clone,
+fn calculate_scaled_dot(
+    it1: impl Iterator<Item = f64> + Clone,
+    it2: impl Iterator<Item = f64> + Clone,
 ) -> f64 {
     // TODO: handle silence. maybe silence => self_dot_product and dot_product both low => dot close to 1
-    fn sum<'a>(it1: impl Iterator<Item = &'a f64>, it2: impl Iterator<Item = &'a f64>) -> f64 {
+    fn sum(it1: impl Iterator<Item = f64>, it2: impl Iterator<Item = f64>) -> f64 {
         // Weight exponentially per frame.
         // We want constant * (falloff^0 + falloff^1 + ... + falloff^total_frame_count) = 1.
         // We have 1 / c = falloff^0 + ... + falloff^total_frame_count = (falloff^(total_frame_count + 1) - 1) / (falloff - 1)
