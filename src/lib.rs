@@ -1,6 +1,7 @@
 pub mod search;
 
 use ordered_float::NotNan;
+use rand::Rng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
 use web_audio_api::context::BaseAudioContext;
@@ -65,29 +66,33 @@ pub fn do_fft(planner: &mut RealFftPlanner<f32>, input: &mut [f32], output: &mut
     output.iter_mut().for_each(|o| *o /= (length as f32).sqrt());
 }
 
-pub struct RandomSubspace<const CHUNK_SIZE: usize> {
-    pub points: Vec<f32>,
+pub struct RandomSubspace<const OUTPUT_DIMS: usize, const INPUT_DIMS: usize> {
+    pub values: Box<[[f32; INPUT_DIMS]; OUTPUT_DIMS]>,
 }
 
 // 2^15 = 32768
 // 44100 / 2^15 = 1.3458252
 // 44100/(440*32) = 3.13210227
 // 44100/(440)*4 = 400.90909091
-impl<const CHUNK_SIZE: usize> RandomSubspace<CHUNK_SIZE> {
-    pub fn random_project(&self, input: &[Complex<f32>]) -> Vec<f64> {
-        assert!(input.len() == self.points.len());
-        assert!(input.len() >= CHUNK_SIZE);
+impl<const OUTPUT_DIMS: usize, const INPUT_DIMS: usize> RandomSubspace<OUTPUT_DIMS, INPUT_DIMS> {
+    pub fn new(rng: &mut impl Rng) -> Self {
+        let mut output = Box::new([[0.0; INPUT_DIMS]; OUTPUT_DIMS]);
+        for row in output.iter_mut() {
+            row.fill_with(|| rng.gen_range(-1.0..1.0))
+        }
+        Self { values: output }
+    }
 
-        self.points
-            .chunks(CHUNK_SIZE)
-            .zip(std::iter::repeat(&input[0..CHUNK_SIZE]))
-            .take(SEARCH_DIMENSIONS)
-            .map(|(v, p)| {
-                // atan is a very expensive operation so we just use magnitude not phase shift
-                v.iter()
-                    .zip(p.iter())
-                    .map(|(r, c)| (c.norm_sqr().sqrt() * r) as f64)
-                    .sum::<f64>()
+    pub fn random_project(&self, input: &[Complex<f32>]) -> Vec<f64> {
+        assert!(input.len() >= INPUT_DIMS);
+
+        self.values
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .zip(input.iter().take(INPUT_DIMS))
+                    .map(|(v, c)| (*v * c.norm_sqr().sqrt()) as f64)
+                    .sum()
             })
             .collect::<Vec<_>>()
     }

@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use fft::search::{ProjectionHistory, RTReeHistory};
 use ordered_float::NotNan;
 use plotters::coord::combinators::LogScalable;
-use rand::Rng;
 use rand::SeedableRng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
@@ -190,18 +189,6 @@ impl FftNode<Receiver<Prediction>> {
             let samples = Arc::new(Mutex::new(vec![]));
             // Deterministic for reproducibility.
             let mut rng = rand::rngs::SmallRng::seed_from_u64(0xDEADBEEF);
-            let mut gen_random_subspace = || {
-                let mut vec = (0..(options.fft_len / 2 + 1))
-                    .map(|_| rng.gen_range(-1.0_f32..1.0))
-                    .collect::<Vec<_>>();
-                // Normalize to unit.
-                let magnitude = vec.iter().map(|v| v.powi(2)).sum::<f32>().sqrt();
-                for el in &mut vec {
-                    *el /= magnitude;
-                }
-
-                RandomSubspace { points: vec }
-            };
             // Set exact size of backing buffer.
             let mut past_input: VecDeque<_> = vec![].into();
             past_input.reserve_exact(options.fft_len);
@@ -214,10 +201,9 @@ impl FftNode<Receiver<Prediction>> {
                 planner: real_planner,
                 past_input,
                 data: vec![Complex::new(0.0, 0.0); options.fft_len / 2 + 1],
-                random_subspace: gen_random_subspace(),
+                random_subspace: RandomSubspace::new(&mut rng),
                 frame_data: FrameData {
                     history: RTReeHistory::default(),
-                    // history: BTreeHistory::new(FFT_LEN / 400),
                     projections: HashMap::new(),
                     frames: vec![],
                 },
@@ -279,7 +265,7 @@ struct FftRenderer {
     past_input: VecDeque<f32>,
     data: Vec<Complex<f32>>,
     planner: RealFftPlanner<f32>,
-    random_subspace: RandomSubspace<{ PROJECTION_LENGTH }>,
+    random_subspace: RandomSubspace<SEARCH_DIMENSIONS, PROJECTION_LENGTH>,
     frame_data: FrameData,
     times: Arc<Mutex<Vec<Time>>>,
     samples: Arc<Mutex<Vec<FftSample>>>,
@@ -289,7 +275,7 @@ struct FftRenderer {
 
 struct FrameData {
     /// Map from random projection to frame number
-    history: RTReeHistory<{ SEARCH_DIMENSIONS }>,
+    history: RTReeHistory<SEARCH_DIMENSIONS>,
     /// Map from timestamp to index in frame_history and projections.
     projections: HashMap<u64, (usize, Vec<NotNan<f32>>)>,
     /// List of consecutive frame numbers
@@ -530,9 +516,12 @@ fn calculate_scaled_dot(
             .sum()
     }
     let dot_product = sum(it1.clone(), it2.clone());
-    let self_dot_product = sum(it2.clone(), it2);
-    let normalized_dot_product = dot_product / self_dot_product;
-    normalized_dot_product.ln().abs()
+
+    // Just normalizing the self and calculating the dot product works equally well it seems
+    // but normalizing both and adding the ratio of the norms feels more correct.
+    let norms = (sum(it2.clone(), it2), sum(it1.clone(), it1));
+    let normalized_dot_product = dot_product / (norms.0 * norms.1).sqrt();
+    normalized_dot_product.ln().abs() + (norms.0 / norms.1).ln().abs()
 }
 
 struct PlaybackNode {
@@ -610,7 +599,8 @@ struct PredictionManager {
 impl PredictionManager {
     /// The range in which two timestamps are considered close enough to be the same prediction.
     const EQUAL_WINDOW: f64 = 1.0;
-    const DECAY_RATIO: f64 = 21.0 / 22.0;
+    const DECAY_RATIO: f64 = 51.0 / 52.0;
+    // const DECAY_RATIO: f64 = 21.0 / 22.0;
     const INCREMENT: f64 = 1.0;
     /// How much larger the count should be than the last prediction's count before switching.
     const JUMP_DISTANCE: f64 = 0.0;
