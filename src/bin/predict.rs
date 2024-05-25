@@ -1,13 +1,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io::Write;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 use fft::search::{ProjectionHistory, RTReeHistory};
 use ordered_float::NotNan;
-use plotters::coord::combinators::LogScalable;
 use rand::SeedableRng;
 use realfft::num_complex::Complex;
 use realfft::RealFftPlanner;
@@ -378,7 +378,7 @@ impl AudioProcessor for FftRenderer {
                     .0
                     .map(|v| v + QUANTUM_SIZE)
                     .filter(|p| {
-                        self.frame_data.projections.get(p).is_some()
+                        self.frame_data.projections.contains_key(p)
                             && scope.current_frame - p > IGNORE_FRAME
                     }),
             )
@@ -469,7 +469,14 @@ fn generate_iterator<'a>(
         .rev()
         // Take the frames such that their FFT input windows don't overlap
         .step_by(FFT_LEN / QUANTUM_SIZE as usize)
-        .flat_map(|c_i| projections.get(c_i).unwrap().1.iter().map(|f| f.as_f64()))
+        .flat_map(|c_i| {
+            projections
+                .get(c_i)
+                .unwrap()
+                .1
+                .iter()
+                .map(|f| (*f.deref()) as f64)
+        })
         // If there are not enough frames, don't just give back 0 error.
         // Instead, fill with 0's so that error can still be calculated against
         // the current_index's past.

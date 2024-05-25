@@ -21,14 +21,11 @@ fn main() {
         .next()
         .and_then(|s| s.parse::<f64>().ok())
         .unwrap_or(1.0);
-    let data = match (
-        fs::read(PathBuf::new().join(&input_directory).join("data.cbor")),
-        fs::read_to_string(PathBuf::new().join(&input_directory).join("data.json")),
-    ) {
-        (Ok(f), _) => serde_cbor::from_slice::<Vec<Time>>(&f).unwrap(),
-        (_, Ok(f)) => serde_json::de::from_str(&f).unwrap(),
-        _ => panic!("Could not read data.cbor or data.json"),
-    };
+    let data = serde_cbor::from_slice::<Vec<Time>>(
+        &fs::read(PathBuf::new().join(&input_directory).join("data.cbor"))
+            .expect("Could not read data.cbor"),
+    )
+    .unwrap();
     // let fft_samples = fs::read_to_string(
     //     PathBuf::new()
     //         .join(&input_directory)
