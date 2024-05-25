@@ -630,9 +630,8 @@ impl PredictionManager {
                 *time = (*time * **count + normalized_time) / (**count + 1.0);
                 *count += Self::INCREMENT;
                 found_match = true;
-            } else {
-                *count *= Self::DECAY_RATIO;
             }
+            *count *= Self::DECAY_RATIO;
         }
 
         if !found_match {
