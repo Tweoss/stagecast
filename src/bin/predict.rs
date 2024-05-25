@@ -30,7 +30,7 @@ const ERROR_FRAME_HISTORY_COUNT: u64 = 16;
 const NEIGHBOR_COUNT: usize = 5;
 /// The maximum distance the dot product can be for a prediction to be
 /// considered good.
-const DOT_LIMIT: f64 = 3.0;
+const DOT_LIMIT: f64 = 1.5;
 
 /// Injected latency in seconds.
 const ARTIFICIAL_LATENCY: f64 = 0.2;
@@ -605,9 +605,9 @@ struct PredictionManager {
 
 impl PredictionManager {
     /// The range in which two timestamps are considered close enough to be the same prediction.
-    const EQUAL_WINDOW: f64 = 1.0;
-    const DECAY_RATIO: f64 = 51.0 / 52.0;
-    // const DECAY_RATIO: f64 = 21.0 / 22.0;
+    const EQUAL_WINDOW: f64 = 0.5;
+    // TODO: skip distance?
+    const DECAY_RATIO: f64 = 300.0 / 301.0;
     const INCREMENT: f64 = 1.0;
     /// How much larger the count should be than the last prediction's count before switching.
     const JUMP_DISTANCE: f64 = 0.0;
