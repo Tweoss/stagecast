@@ -214,6 +214,7 @@ impl FftNode<Receiver<Prediction>> {
                     data: vec![],
                     last_prediction: None,
                 },
+                start_time: context.current_time(),
             };
             let node = FftNode {
                 registration,
@@ -271,6 +272,7 @@ struct FftRenderer {
     samples: Arc<Mutex<Vec<FftSample>>>,
     last_prediction: (Option<u64>, Sender<Prediction>),
     prediction_manager: PredictionManager,
+    start_time: f64,
 }
 
 struct FrameData {
@@ -435,11 +437,13 @@ impl AudioProcessor for FftRenderer {
             self.last_prediction.0 = Some(frame);
 
             self.times.lock().unwrap().push(Time {
-                real: scope.current_time,
-                predicted: predicted_time - ARTIFICIAL_LATENCY,
+                real: scope.current_time - self.start_time,
+                predicted: predicted_time - ARTIFICIAL_LATENCY - self.start_time,
                 projection: current_projections.clone(),
                 error: *error,
-                managed_prediction: prediction.predicted_time - ARTIFICIAL_LATENCY,
+                managed_prediction: prediction.predicted_time
+                    - ARTIFICIAL_LATENCY
+                    - self.start_time,
                 dot_error,
             });
         }
